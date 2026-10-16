@@ -1,0 +1,3237 @@
+diff --git a/include/bodyprog/text/text_draw.h b/include/bodyprog/text/text_draw.h
+index 5a981ea..a64b4e4 100644
+--- a/include/bodyprog/text/text_draw.h
++++ b/include/bodyprog/text/text_draw.h
+@@ -108,6 +108,11 @@ void Gfx_StringSetColor(s16 colorId);
+  */
+ bool Gfx_StringDraw(char* str, s32 strLength);
+ 
++#ifdef SH_RGDS
++/** RG DS Plus: Q12 size of high-res glyphs drawn by `Gfx_StringDraw`, about the string start. */
++void Gfx_RgdsStringScaleSet(s32 scaleQ12);
++#endif
++
+ s32 Gfx_MapMsg_CalculateWidths(s32 mapMsgIdx);
+ 
+ /** Draws string and returns map message index. */
+diff --git a/pc_port/CMakeLists.txt b/pc_port/CMakeLists.txt
+index fe2eb14..ce38f6c 100644
+--- a/pc_port/CMakeLists.txt
++++ b/pc_port/CMakeLists.txt
+@@ -29,6 +29,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ # Options
+ # =============================================================================
+ option(SH_USE_OPENGL "Use OpenGL renderer (via PsyCross)" ON)
++option(SH_RGDS "Build for the RG DS Plus (two screens)" OFF)
+ option(SH_DEBUG "Enable debug output" OFF)
+ option(SH_ASAN "Enable AddressSanitizer for memory corruption detection" OFF)
+ # FMV ffmpeg fallback (native h264/h265/vp9/av1 in mp4/mkv/webm/avi override files).
+@@ -55,6 +56,12 @@ endif()
+ # Build this BEFORE setting game-specific defines so they don't pollute PsyCross
+ # =============================================================================
+ 
++if(SH_RGDS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$" AND
++   CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
++    # Tune scheduling for the handheld without requiring additional ISA extensions.
++    add_compile_options(-mtune=cortex-a55)
++endif()
++
+ # PGXP: COMPILE-TIME OFF. The intent was for this to be compiled in
+ # and runtime-gated by g_PsxUsePgxp (driven by config.cfg `use_pgxp`),
+ # but flipping USE_PGXP=1 introduced regressions on the runtime-OFF
+@@ -606,8 +613,15 @@ endif()
+ if(WIN32)
+     target_link_libraries(SilentHillPC PRIVATE opengl32 winmm m)
+ elseif(UNIX)
+-    find_package(OpenGL REQUIRED)
+-    target_link_libraries(SilentHillPC PRIVATE OpenGL::GL)
++    if(SH_RGDS)
++        find_library(SH_GLES_LIBRARY GLESv2 REQUIRED)
++        find_library(SH_WAYLAND_LIBRARY wayland-client REQUIRED)
++        target_link_libraries(SilentHillPC PRIVATE ${SH_GLES_LIBRARY} ${SH_WAYLAND_LIBRARY})
++        target_compile_definitions(SilentHillPC PRIVATE SH_RGDS)
++    else()
++        find_package(OpenGL REQUIRED)
++        target_link_libraries(SilentHillPC PRIVATE OpenGL::GL)
++    endif()
+ endif()
+ 
+ # =============================================================================
+diff --git a/pc_port/include/pc_config.h b/pc_port/include/pc_config.h
+index 8cf2a85..84fe851 100644
+--- a/pc_port/include/pc_config.h
++++ b/pc_port/include/pc_config.h
+@@ -261,6 +261,9 @@ typedef struct {
+      * by pc_rando_config.c — NOT here — so config.cfg stays clean and the in-game
+      * panel / Lua layer read+write a single dedicated store (s_RandoConfig). */
+     int controllerMovement; /* 0 = analog stick, 1 = d-pad, 2 = both (default) */
++    int rgdsSwapFaceButtons; /* RG DS Plus, this game only (config key: rgds_swap_face_buttons): mask, 1 = swap A<->B, 2 = swap X<->Y */
++    int rgdsMapBottom;       /* RG DS Plus: 1 = the map button in the world opens the original map on the bottom screen (config key: rgds_map_bottom) */
++    char rgdsBootConsole[96]; /* RG DS Plus testing: console command(s), ';' separated, run once by the world on the first gameplay frame (config key: rgds_boot_console); empty = none */
+     int movementOriginal;   /* 1 = PSX lower-body movement state
+                              * machine (accel/decel, wall smack, authored sidesteps)
+                              * (default). 0 = legacy PC movement shim (TPS debug cam + fallback). */
+diff --git a/pc_port/src/dbg_overlay.c b/pc_port/src/dbg_overlay.c
+index e0291ba..08f6040 100644
+--- a/pc_port/src/dbg_overlay.c
++++ b/pc_port/src/dbg_overlay.c
+@@ -418,6 +418,11 @@ static const unsigned char s_font[128][8] = {
+     [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00},
+ };
+ 
++const unsigned char* DbgOverlay_Glyph(unsigned char ch)
++{
++    return s_font[ch & 127];
++}
++
+ static void push_console_raw(const char* line)
+ {
+     int shift = (s_console_count < MAX_CONSOLE) ? s_console_count : MAX_CONSOLE - 1;
+@@ -2051,6 +2056,26 @@ void DbgOverlay_Update(void)
+ 
+ void DbgOverlay_Render(void)
+ {
++    /* RG DS bottom screen: black until the live inventory opens, instead of a
++     * second, inert copy of the title screen. */
++    {
++        extern int RgDs_NativeIsMenuProcess(void);
++        extern int RgDs_NativeMenuReady(void);
++
++        if (RgDs_NativeIsMenuProcess() && !RgDs_NativeMenuReady())
++        {
++            GLfloat   clear[4];
++            GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++
++            glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
++            glDisable(GL_SCISSOR_TEST);
++            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++            glClear(GL_COLOR_BUFFER_BIT);
++            glClearColor(clear[0], clear[1], clear[2], clear[3]);
++            if (scissor)
++                glEnable(GL_SCISSOR_TEST);
++        }
++    }
+     /* Publish whether this frame renders the 3D world, for the image-adjustment
+      * scope in GR_PostProcess (which runs immediately after this hook). The
+      * movie, menu, inventory, paper-map, save and load screens draw no world,
+@@ -2106,6 +2131,16 @@ void DbgOverlay_Render(void)
+      * under the Yes/No box, which it opens for its reset. */
+     { extern void Pc_BindPanel_Draw(void); Pc_BindPanel_Draw(); }
+ 
++    /* RG DS bottom screen: the paper map's close / zoom buttons. */
++    {
++        extern int  RgDs_NativeMapIcons(void);
++        extern void RgDs_MapIconsDraw(int zoomed);
++        int icons = RgDs_NativeMapIcons();
++
++        if (icons)
++            RgDs_MapIconsDraw(icons == 2);
++    }
++
+     { extern void Pc_ConfirmDialog_Draw(void); Pc_ConfirmDialog_Draw(); }
+ 
+     /* Console is hidden once fully slid off-screen (toggled by `~`); the ring
+diff --git a/pc_port/src/main_pc.c b/pc_port/src/main_pc.c
+index 5bd38cd..68c27f3 100644
+--- a/pc_port/src/main_pc.c
++++ b/pc_port/src/main_pc.c
+@@ -22,6 +22,7 @@
+ #include "sh_log.h"
+ #include "psx_memory.h"
+ #include "pc_config.h"
++#include "rgds_inventory.h"
+ #include "hires_override.h" /* HiresOverride_ClampBudgetToVram */
+ #include "pc_audio_config.h"
+ #include "pc_discord.h"
+@@ -235,6 +236,13 @@ const char* SH_LogPath(void)
+         if (!lt || strftime(s_logPath, sizeof(s_logPath), "SilentHill_%Y%m%d_%H%M%S.log", lt) == 0) {
+             snprintf(s_logPath, sizeof(s_logPath), "SilentHill.log");
+         }
++        if (getenv("SH_RGDS_ROLE")) {
++            char base[48];
++            snprintf(base, sizeof(base), "%.40s", s_logPath);
++            base[strlen(base) - 4] = '\0';
++            snprintf(s_logPath, sizeof(s_logPath), "%s_%s.log", base,
++                     strcmp(getenv("SH_RGDS_ROLE"), "inventory") == 0 ? "inventory" : "game");
++        }
+     }
+     return s_logPath;
+ }
+@@ -900,6 +908,24 @@ int main(int argc, char* argv[])
+             g_PsyX_PostCaptureHook = DbgOverlay_Render;
+         }
+     }
++    if (RgDs_Enabled()) {
++        /* PsyCross gates its idle sleeps and GLES sizing on this variable. */
++        setenv("SH_RGDS", "1", 0);
++        strcpy(g_PcConfig.renderer, "gles");
++        g_PcConfig.windowWidth = 1024;
++        g_PcConfig.windowHeight = 768;
++        g_PcConfig.fullscreen = 0;
++        g_PcConfig.confineCursor = 0;
++        const char* role = getenv("SH_RGDS_ROLE");
++        const char* menuNative = getenv("SH_RGDS_MENU_NATIVE");
++        /* The bottom menu renders its models at panel resolution like the top;
++         * SH_RGDS_MENU_NATIVE=1 restores the 320-wide PS1 target. */
++        if (role && strcmp(role, "inventory") == 0)
++            g_PcConfig.nativeResolution = menuNative && strcmp(menuNative, "0") != 0;
++        g_PcConfig.msaaSamples = 0;
++        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++        PsyX_Pad_SetFaceSwap(g_PcConfig.rgdsSwapFaceButtons);
++    }
+     int windowWidth = g_PcConfig.windowWidth;
+     int windowHeight = g_PcConfig.windowHeight;
+ 
+@@ -1051,11 +1077,25 @@ int main(int argc, char* argv[])
+         g_PcNativeRender = g_PcConfig.nativeResolution;
+         if (g_PcNativeRender)
+             SH_LOG("Render: native PSX resolution, %dx%d window", windowWidth, windowHeight);
++        else
++            SH_LOG("Render: %dx%d internal resolution", windowWidth, windowHeight);
++    }
++
++    /* RG DS Plus: the PSX shaders are compiled without the paths this config never
++     * reaches (texture/menu filtering, per-pixel flashlight). It is the largest GPU
++     * saving of the RG DS options. The choice is made here because the shaders
++     * compile inside PsyX_Initialise, before the filter settings below are applied.
++     * SH_RGDS_LEAN_SHADER=0/1 overrides. */
++    {
++        extern int g_PsyX_RgdsLeanShaderDefault;
++        g_PsyX_RgdsLeanShaderDefault = getenv("SH_RGDS") && g_PcConfig.textureFilter == 0 &&
++                                       !g_PcConfig.menuFilter && !g_PcConfig.perPixelFlashlight;
+     }
+ 
+     /* Initialize PsyCross (creates SDL2 window + OpenGL context) */
+     SH_LOG("Initializing PsyCross (SDL2 + OpenGL)...");
+     PsyX_Initialise("Silent Hill", windowWidth, windowHeight, g_PcConfig.fullscreen);
++    RgDs_Init();
+ 
+     SH_LOG("PsyCross initialized. Window: %dx%d", windowWidth, windowHeight);
+ 
+diff --git a/pc_port/src/pc_combat.c b/pc_port/src/pc_combat.c
+index 84b299f..79535ad 100644
+--- a/pc_port/src/pc_combat.c
++++ b/pc_port/src/pc_combat.c
+@@ -16,6 +16,8 @@
+ #include "dbg_overlay.h" /* DbgOverlay_ToastLine — quick-heal result line */
+ #include <stdio.h>
+ #include "bodyprog/sound/sound_system.h"
++#include "bodyprog/gfx/map_effects.h"
++#include "rgds_native.h"
+ extern int Pc_ConsoleIsOpen(void);
+ 
+ extern const unsigned char* g_sdlKeyboardState;
+@@ -261,12 +263,17 @@ static int Pc_ActionSafe(void)
+            g_SysWork.playerWork.extra.upperBodyState <= PlayerUpperBodyState_SidestepRightStumble;
+ }
+ 
++static void Pc_AmmoWriteBack(s_Savegame* save);
++
+ /* Equip one owned weapon — mirrors the load-time re-equip block
+  * (player_control.c:10312-10343) + the model reload. */
+ static void Pc_EquipWeapon(u8 invItemId, s32 slot)
+ {
+     s32 groupId = INV_ITEM_GROUP(invItemId);
+ 
++    /* The outgoing gun's slot would otherwise keep the clip from its last reload. */
++    Pc_AmmoWriteBack(g_SavegamePtr);
++
+     /* Silence the outgoing weapon, the way opening the inventory does.
+      *
+      * A quick switch is the whole of "open inventory, pick a weapon, close", and
+@@ -334,6 +341,163 @@ static void Pc_EquipWeapon(u8 invItemId, s32 slot)
+     }
+ }
+ 
++/* Gameplay keeps the live clip and reserve in playerCombat; the inventory slots
++ * only catch up when the inventory opens (func_800540A4). The bottom menu never
++ * opens it, so the world writes them back itself before showing or using them. */
++static void Pc_AmmoWriteBack(s_Savegame* save)
++{
++    s32 i, weapon = NO_VALUE;
++    u8  id = save->equippedWeapon;
++
++    if (INV_ITEM_GROUP(id) != InvItemGroup_GunWeapons)
++        return;
++    for (i = 0; i < save->inventorySlotCount && i < INV_ITEM_COUNT_MAX; i++)
++        if (save->items[i].id_0 == id) { weapon = i; break; }
++    if (weapon == NO_VALUE)
++        return;
++    save->items[weapon].count_1 = g_SysWork.playerCombat.currentWeaponAmmo;
++    for (i = 0; i < save->inventorySlotCount && i < INV_ITEM_COUNT_MAX; i++)
++        if (save->items[i].id_0 == INV_WEAPON_AMMO_ID(id)) { save->items[i].count_1 = g_SysWork.playerCombat.totalWeaponAmmo; break; }
++}
++
++void Pc_RgdsPublishAmmo(s_Savegame* save)
++{
++    Pc_AmmoWriteBack(save);
++}
++
++static void Pc_GasWeaponStop(void)
++{
++    u8 prevId = WEAPON_ATTACK_ID_GET(g_Player_WeaponAttack);
++
++    if ((prevId == EquippedWeaponId_Chainsaw && g_SysWork.playerCombat.weaponAttack != prevId) ||
++        (prevId == EquippedWeaponId_RockDrill &&
++         g_SysWork.playerCombat.weaponAttack != WEAPON_ATTACK(prevId, AttackInputType_Tap)))
++    {
++        g_SysWork.playerWork.player.field_44.field_0 = 0;
++        g_SysWork.playerWork.player.properties.player.gasWeaponPowerTimer = Q12(0.0f);
++    }
++}
++
++/* RG DS bottom menu: the original inventory commands applied to the live world.
++ * Mirrors item_screens_3.c steps 5-9 and Inventory_ItemUse without the menu's
++ * pause; see rgds_native.h for the result codes. */
++int Pc_RgdsItemAction(unsigned char id, int op)
++{
++    s32 slot, group;
++
++    if (!Pc_ActionSafe() || g_SysWork.playerWork.player.health <= 0)
++        return -1;
++    Pc_AmmoWriteBack(g_SavegamePtr);
++    slot = Pc_FindItemSlot(id);
++    if (slot == NO_VALUE)
++        return -2;
++    group = INV_ITEM_GROUP(id);
++
++    switch (op)
++    {
++        case RgDsOp_Equip:
++            if (group != InvItemGroup_MeleeWeapons && group != InvItemGroup_GunWeapons)
++                return 0;
++            if (g_SavegamePtr->equippedWeapon != id)
++                Pc_EquipWeapon(id, slot);
++            return 1;
++
++        case RgDsOp_Unequip:
++            if (g_SavegamePtr->equippedWeapon != id)
++                return 0;
++            func_8004C564(0, NO_VALUE);
++            g_Inventory_EquippedItem = g_SavegamePtr->equippedWeapon = InvItemId_Unequipped;
++            g_SysWork.playerCombat.weaponAttack = NO_VALUE;
++            g_SysWork.playerCombat.weaponInventoryIdx = NO_VALUE;
++            g_SysWork.playerCombat.currentWeaponAmmo = g_SysWork.playerCombat.totalWeaponAmmo = 0;
++            Pc_GasWeaponStop();
++            GameFs_WeaponInfoUpdate();
++            WorldGfx_PlayerPrevHeldItem(&g_SysWork.playerCombat);
++            func_8003D01C();
++            return 1;
++
++        case RgDsOp_Reload:
++        {
++            s32 gun = (group == InvItemGroup_GunAmmo) ? INV_AMMO_WEAPON_ID(id) : id;
++            s32 gunSlot, ammoSlot, clip, ammo;
++
++            if (INV_ITEM_GROUP(gun) != InvItemGroup_GunWeapons || gun == InvItemId_HyperBlaster)
++                return 0;
++            gunSlot  = Pc_FindItemSlot((u8)gun);
++            ammoSlot = Pc_FindItemSlot((u8)INV_WEAPON_AMMO_ID(gun));
++            if (gunSlot == NO_VALUE)
++                return 0;
++            /* The original accepts Reload on a full clip or without a box and
++             * changes nothing (steps 7/8 run with nothing to move). */
++            if (ammoSlot == NO_VALUE || !g_SavegamePtr->items[ammoSlot].count_1)
++                return 1;
++            clip = g_SavegamePtr->items[gunSlot].count_1;
++            ammo = g_SavegamePtr->items[ammoSlot].count_1;
++            Items_AmmoReloadCalculation(&clip, &ammo, (u8)(gun + 0x80));
++            if (clip == g_SavegamePtr->items[gunSlot].count_1)
++                return 1;
++            g_SavegamePtr->items[gunSlot].count_1  = clip;
++            g_SavegamePtr->items[ammoSlot].count_1 = ammo;
++            if (g_SavegamePtr->equippedWeapon == gun)
++            {
++                g_SysWork.playerCombat.currentWeaponAmmo = clip;
++                g_SysWork.playerCombat.totalWeaponAmmo   = ammo;
++            }
++            /* An emptied box leaves the inventory, as in the original reload. */
++            if (!ammo)
++                g_SavegamePtr->inventorySlotCount = func_8004F190(g_SavegamePtr);
++            return 1;
++        }
++
++        case RgDsOp_On:
++        case RgDsOp_Off:
++            if (id == InvItemId_Flashlight)
++            {
++                if (op == RgDsOp_On) Game_TurnFlashlightOn(); else Game_TurnFlashlightOff();
++                return 1;
++            }
++            if (id == InvItemId_PocketRadio)
++            {
++                if (op == RgDsOp_On) g_SavegamePtr->itemToggleFlags |= ItemToggleFlag_RadioOn;
++                else g_SavegamePtr->itemToggleFlags &= ~ItemToggleFlag_RadioOn;
++                return 1;
++            }
++            return 0;
++
++        case RgDsOp_Use:
++            if (id == InvItemId_HealthDrink || id == InvItemId_FirstAidKit || id == InvItemId_Ampoule)
++            {
++                q19_12 health = g_SysWork.playerWork.player.health;
++
++                if (!g_SavegamePtr->items[slot].count_1)
++                    return -2;
++                health += (id == InvItemId_FirstAidKit) ? Q12(80.0f) : (id == InvItemId_HealthDrink) ? Q12(40.0f) : Q12(100.0f);
++                if (id == InvItemId_Ampoule)
++                    g_SavegamePtr->healthSaturation = Q12(300.0f);
++                Sd_PlaySfx(Sfx_Unk1325, -0x40, 0x40);
++                g_SysWork.playerWork.player.health = CLAMP(health, Q12(0.0f), Q12(100.0f));
++                Player_ItemRemove(id, 1);
++                return 1;
++            }
++            {
++                s32 step1 = g_GameWork.gameStateSteps[1], step2 = g_GameWork.gameStateSteps[2];
++                s32 selection = g_Inventory_SelectionId, border = g_Inventory_SelectionBordersDraw, used;
++
++                Inventory_ItemUse(slot);
++                used = g_GameWork.gameStateSteps[1] == 11;
++                /* Inventory_ItemUse drives the menu FSM; the world is in gameplay, so
++                 * keep its steps and let Event_Update consume lastUsedItem. The map
++                 * event removes a used key itself. */
++                g_GameWork.gameStateSteps[1] = step1;
++                g_GameWork.gameStateSteps[2] = step2;
++                g_Inventory_SelectionId = selection;
++                g_Inventory_SelectionBordersDraw = border;
++                return used;
++            }
++    }
++    return 0;
++}
++
+ /* Cycle to the next OWNED weapon in acquisition/enum order (wraps). */
+ void Pc_CycleWeapons(void)
+ {
+@@ -610,6 +774,7 @@ void Pc_ExtraActionsUpdate(void)
+     int cycleClicked, healClicked, qtClicked, sch;
+ 
+     g_PcInputFrame++; /* frame identity for the edge caches — see g_PcInputFrame */
++    if (RgDs_NativeInputFocus()) return;
+ 
+     static int          s_actGen = -1;
+     if (s_padCycle[0] == -2 || s_actGen != g_PcBindsGen) {
+diff --git a/pc_port/src/pc_config.c b/pc_port/src/pc_config.c
+index c7b1b6b..5d9f922 100644
+--- a/pc_port/src/pc_config.c
++++ b/pc_port/src/pc_config.c
+@@ -924,6 +924,19 @@ void PcConfig_Load(const char* path)
+             else if (strcmp(value, "dpad") == 0) g_PcConfig.controllerMovement = 1;
+             else                                 g_PcConfig.controllerMovement = 2; /* both */
+         }
++        else if (strcmp(key, "rgds_swap_face_buttons") == 0)
++        {
++            g_PcConfig.rgdsSwapFaceButtons = atoi(value) & 3; /* 1 = A<->B, 2 = X<->Y */
++        }
++        else if (strcmp(key, "rgds_map_bottom") == 0)
++        {
++            g_PcConfig.rgdsMapBottom = (atoi(value) != 0);
++        }
++        else if (strcmp(key, "rgds_boot_console") == 0)
++        {
++            strncpy(g_PcConfig.rgdsBootConsole, value, sizeof(g_PcConfig.rgdsBootConsole) - 1);
++            g_PcConfig.rgdsBootConsole[sizeof(g_PcConfig.rgdsBootConsole) - 1] = '\0';
++        }
+         else if (strcmp(key, "movement_original") == 0)
+         {
+             g_PcConfig.movementOriginal = (atoi(value) != 0);
+@@ -1653,6 +1666,33 @@ static char** PcConfig_ReadLines(int* outCount)
+     return lines;
+ }
+ 
++/* RG DS Plus: the world and the bottom-menu process share one config.cfg. Only
++ * the world writes it, and a rewrite goes through a temporary file so the other
++ * process never reads a half-written config (a truncated read dropped map= and
++ * enable_debug_log= and booted the menu into the wrong map). */
++static FILE* PcConfig_OpenRewrite(char* tmpPath, size_t size)
++{
++#if defined(SH_RGDS) && defined(__linux__)
++    const char* role = getenv("SH_RGDS_ROLE");
++    if (role && strcmp(role, "inventory") == 0)
++        return NULL;
++    snprintf(tmpPath, size, "%s.tmp", s_configPath);
++    return fopen(tmpPath, "w");
++#else
++    (void)size;
++    tmpPath[0] = '\0';
++    return fopen(s_configPath, "w");
++#endif
++}
++
++static void PcConfig_CommitRewrite(FILE* f, const char* tmpPath)
++{
++    if (fclose(f) == 0 && tmpPath[0] != '\0')
++        rename(tmpPath, s_configPath);
++    else if (tmpPath[0] != '\0')
++        remove(tmpPath);
++}
++
+ static void PcConfig_FreeLines(char** lines, int n)
+ {
+     int i;
+@@ -1664,6 +1704,7 @@ static void PcConfig_FreeLines(char** lines, int n)
+ void PcConfig_SaveKeyValues(const char* const* keys, const char* const* values, int count)
+ {
+     static char found[256];
++    char        tmpPath[1100];
+     char**      lines;
+     int         n = 0;
+     int         i, k;
+@@ -1714,7 +1755,7 @@ void PcConfig_SaveKeyValues(const char* const* keys, const char* const* values,
+         }
+     }
+ 
+-    f = fopen(s_configPath, "w");
++    f = PcConfig_OpenRewrite(tmpPath, sizeof(tmpPath));
+     if (f)
+     {
+         for (i = 0; i < n; i++)
+@@ -1724,7 +1765,7 @@ void PcConfig_SaveKeyValues(const char* const* keys, const char* const* values,
+             if (!found[k] && keys[k] != NULL && keys[k][0] != '\0' && values[k] != NULL)
+                 fprintf(f, "%s = %s\n", keys[k], values[k]);
+         }
+-        fclose(f);
++        PcConfig_CommitRewrite(f, tmpPath);
+     }
+     PcConfig_FreeLines(lines, n);
+ }
+@@ -1735,6 +1776,7 @@ void PcConfig_SaveKeyValues(const char* const* keys, const char* const* values,
+  * file, pasted into a message, and pasted back. */
+ void PcConfig_SaveBindLines(const char* const* lines, int count)
+ {
++    char   tmpPath[1100];
+     char** buf;
+     int    total = 0;
+     int    n = 0;
+@@ -1768,7 +1810,7 @@ void PcConfig_SaveBindLines(const char* const* lines, int count)
+         free(buf[--n]);
+     }
+ 
+-    f = fopen(s_configPath, "w");
++    f = PcConfig_OpenRewrite(tmpPath, sizeof(tmpPath));
+     if (!f)
+     {
+         PcConfig_FreeLines(buf, n);
+@@ -1785,7 +1827,7 @@ void PcConfig_SaveBindLines(const char* const* lines, int count)
+                 fprintf(f, "%s\n", lines[i]);
+         }
+     }
+-    fclose(f);
++    PcConfig_CommitRewrite(f, tmpPath);
+     PcConfig_FreeLines(buf, n);
+ }
+ 
+diff --git a/pc_port/src/pc_console_cmd.c b/pc_port/src/pc_console_cmd.c
+index ccbe002..50a17c6 100644
+--- a/pc_port/src/pc_console_cmd.c
++++ b/pc_port/src/pc_console_cmd.c
+@@ -1639,6 +1639,12 @@ void Pc_ConsoleExec(const char* line)
+         extern int g_dbg_wireframeMode;
+         g_dbg_wireframeMode = (arg[0] == '1') ? 1 : (arg[0] == '0') ? 0 : !g_dbg_wireframeMode;
+         cprintf("wireframe %s", g_dbg_wireframeMode ? "ON" : "OFF");
++    } else if (strcmp(cmd, "SEAM") == 0) {
++        /* RG DS seam fill, PS1 pixels (PsyX_GPU.cpp); 0 = off. */
++        extern float g_PsyX_RgdsSeamExpand;
++        float value = (float)atof(arg);
++        g_PsyX_RgdsSeamExpand = (value > 0.0f && value <= 2.0f) ? value : 0.0f;
++        cprintf("seam expand %.2f", g_PsyX_RgdsSeamExpand);
+     } else if (strcmp(cmd, "NOTEX") == 0) {
+         extern int g_dbg_texturelessMode;
+         g_dbg_texturelessMode = (arg[0] == '1') ? 1 : (arg[0] == '0') ? 0 : !g_dbg_texturelessMode;
+diff --git a/pc_port/src/pc_inventory_mouse.c b/pc_port/src/pc_inventory_mouse.c
+index a39a1ca..79b47d2 100644
+--- a/pc_port/src/pc_inventory_mouse.c
++++ b/pc_port/src/pc_inventory_mouse.c
+@@ -31,6 +31,8 @@
+ #include "pc_config.h"
+ #include "pc_inventory_mouse.h"
+ #include "pc_mouse_cursor.h"
++#include "pc_confirm_dialog.h"
++#include "rgds_native.h"
+ 
+ #include <PsyX/PsyX_public.h>
+ 
+@@ -90,6 +92,16 @@ static const s16 INV_SLOT_BAND_MAX[7] = { -101, -80, -31, 31, 80, 101, 160 };
+  * more than one — a multi-slot click is walked out one stock step at a time. */
+ static s32 s_scrollTarget = -1;
+ 
++#ifdef SH_RGDS
++/* RG DS touch: Inventory_Logic drops input until the selection bracket settles
++ * (g_Inventory_SelectionBordersDraw reaches 8 after its own increment), so a tap
++ * right after a scroll or after opening the command list vanished. Hold it until
++ * the same selection is ready instead. */
++static s32 s_heldEnterFrames;
++static u32 s_heldEnterSelection;
++static s32 s_heldEnterRow = -1;
++#endif
++
+ static int Inv_InBox(const s_InvBox* b, s32 x, s32 y)
+ {
+     return x >= b->x0 && x <= b->x1 && y >= b->y0 && y <= b->y1;
+@@ -127,6 +139,21 @@ static void Inv_Press(u32 bits)
+     g_Controller0->heldBtnFlags    |= bits;
+ }
+ 
++static void Inv_Enter(s32 row)
++{
++#ifdef SH_RGDS
++    if (g_Inventory_SelectionBordersDraw < 7)
++    {
++        s_heldEnterFrames    = 20;
++        s_heldEnterSelection = g_Inventory_SelectionId;
++        s_heldEnterRow       = row;
++        return;
++    }
++#endif
++    (void)row;
++    Inv_Press(g_GameWorkPtr->config.controllerConfig.enter);
++}
++
+ /* Move the selection to a region without the stock 7-frame settle. The region
+  * transitions all reset g_Inventory_SelectionBordersDraw to 1, and Inventory_Logic
+  * then REJECTS input until it climbs back past 7 — so a hover that reset it would
+@@ -204,6 +231,13 @@ void Pc_Inventory_MouseUpdate(void)
+     if (!g_PcConfig.mouseCursor)
+         return;
+ 
++#ifdef SH_RGDS
++    /* The bottom screen's Exit confirmation sits over the inventory and reads
++     * the pointer itself; a tap on its buttons must not also hit the carousel. */
++    if (RgDs_NativeExitAsking())
++        return;
++#endif
++
+     /* Only the live inventory. Everything else gameStateSteps[1] runs (option
+      * hand-off, results/save screen, the fade out) reuses these globals for
+      * something else entirely. */
+@@ -226,6 +260,25 @@ void Pc_Inventory_MouseUpdate(void)
+     if (slotCount <= 0)
+         return;
+ 
++#ifdef SH_RGDS
++    if (s_heldEnterFrames > 0)
++    {
++        s_heldEnterFrames--;
++        if (g_Inventory_SelectionId != s_heldEnterSelection)
++        {
++            s_heldEnterFrames = 0;
++        }
++        else if (g_Inventory_SelectionBordersDraw >= 7)
++        {
++            if (s_heldEnterRow >= 0)
++                g_Inventory_CmdSelectedIdx = s_heldEnterRow;
++            s_heldEnterFrames = 0;
++            Inv_Press(g_GameWorkPtr->config.controllerConfig.enter);
++            return;
++        }
++    }
++#endif
++
+     /* Walk out a pending click-to-scroll. Injecting clicked+held drives the stock
+      * auto-scroll path (which latches g_Inventory_IsScrolling), so it advances at
+      * the same rate as holding the stick and animates itself. */
+@@ -263,13 +316,34 @@ void Pc_Inventory_MouseUpdate(void)
+         s32 row     = NO_VALUE;
+         s32 i;
+ 
++#ifdef SH_RGDS
++        /* RG DS Plus bottom screen: the rows are drawn 1.4x and RGDS_CMD_STEP apart
++         * (item_screens_2.c); a fingertip anywhere in the Command area picks the
++         * nearest row, so each row owns half of the area instead of a 12-unit bar. */
++        if (RgDs_NativeIsMenuProcess())
++        {
++            static const s_InvBox RGDS_BOX_CMD = { 36, -214, 160, -60 };
++            s32 bigY0 = (count >= 2) ? RGDS_CMD_Y0_DOUBLE : RGDS_CMD_Y0_SINGLE;
++
++            if (rightClicked || (clicked && !Inv_InBox(&RGDS_BOX_CMD, x, y)))
++            {
++                Inv_Press(g_GameWorkPtr->config.controllerConfig.cancel);
++                return;
++            }
++            if (count > 0 && Inv_InBox(&RGDS_BOX_CMD, x, y))
++            {
++                row = (count >= 2 && y >= bigY0 + RGDS_CMD_STEP + RGDS_CMD_BAR_HALF - (RGDS_CMD_STEP / 2)) ? 1 : 0;
++            }
++        }
++        else
++#endif
+         if (rightClicked || (clicked && !Inv_InBox(&INV_BOX_CMD, x, y)))
+         {
+             Inv_Press(g_GameWorkPtr->config.controllerConfig.cancel);
+             return;
+         }
+ 
+-        if (x >= INV_CMD_X0 && x <= INV_CMD_X1)
++        if (row == NO_VALUE && x >= INV_CMD_X0 && x <= INV_CMD_X1)
+         {
+             for (i = 0; i < count; i++)
+             {
+@@ -294,7 +368,7 @@ void Pc_Inventory_MouseUpdate(void)
+         }
+ 
+         if (clicked)
+-            Inv_Press(g_GameWorkPtr->config.controllerConfig.enter);
++            Inv_Enter(row);
+ 
+         return;
+     }
+@@ -317,7 +391,7 @@ void Pc_Inventory_MouseUpdate(void)
+             if (clicked)
+             {
+                 if (slot == 0)
+-                    Inv_Press(g_GameWorkPtr->config.controllerConfig.enter);
++                    Inv_Enter(-1);
+                 else
+                     s_scrollTarget = ((g_SysWork.invItemSelectedIdx + slot) + slotCount) % slotCount;
+             }
+@@ -337,7 +411,7 @@ void Pc_Inventory_MouseUpdate(void)
+             Inv_SnapSelection(InventorySelectionId_EquippedItem);
+ 
+         if (clicked)
+-            Inv_Press(g_GameWorkPtr->config.controllerConfig.enter);
++            Inv_Enter(-1);
+         return;
+     }
+ 
+@@ -359,6 +433,6 @@ void Pc_Inventory_MouseUpdate(void)
+             Inv_SnapSelection(id);
+ 
+         if (clicked)
+-            Inv_Press(g_GameWorkPtr->config.controllerConfig.enter);
++            Inv_Enter(-1);
+     }
+ }
+diff --git a/pc_port/src/pc_mouse_cursor.c b/pc_port/src/pc_mouse_cursor.c
+index 5ce343d..4bfb841 100644
+--- a/pc_port/src/pc_mouse_cursor.c
++++ b/pc_port/src/pc_mouse_cursor.c
+@@ -61,8 +61,15 @@ static int   s_prevWheelUp, s_prevWheelDown;
+ 
+ static int Mc_Enabled(void)
+ {
++    extern int RgDs_NativeIsMenuProcess(void);
++    extern int RgDs_NativeMenuReady(void);
++
+     if (!g_PcConfig.mouseCursor)
+         return 0;
++    /* RG DS bottom screen: until the inventory opens this process sits on the
++     * title, where a tap on the clickable main menu would start a second game. */
++    if (RgDs_NativeIsMenuProcess() && !RgDs_NativeMenuReady())
++        return 0;
+     /* Only when the OS cursor is free. In TPS/OTS/FPS the pointer is captured
+      * for camera look, so its absolute position is meaningless. */
+     if (SDL_GetRelativeMouseMode() == SDL_TRUE)
+@@ -195,6 +202,18 @@ void Pc_MouseCursor_FrameUpdate(void)
+     }
+ 
+     btn         = SDL_GetMouseState(&mx, &my);
++    {
++        /* RG DS bottom screen: a tap that starts and ends between two frames never
++         * shows in the polled state; replay its press for one frame. */
++        extern int RgDs_NativeTakeTap(int* x, int* y);
++        int tapX, tapY;
++        if (RgDs_NativeTakeTap(&tapX, &tapY) && !s_prevLeft)
++        {
++            mx = tapX;
++            my = tapY;
++            btn |= SDL_BUTTON(SDL_BUTTON_LEFT);
++        }
++    }
+     s_moved     = (mx != s_prevMx || my != s_prevMy);
+     s_prevMx    = mx;
+     s_prevMy    = my;
+@@ -307,12 +326,20 @@ int Pc_MouseCursor_MenuRowHover(int baseY, int stepY, int count, unsigned int vi
+     return hovered;
+ }
+ 
++/* RG DS bottom screen: input is touch, and the original inventory has no
++ * pointer, so the PC arrow is not drawn there. */
++static int Mc_HideArrow(void)
++{
++    extern int RgDs_NativeIsMenuProcess(void);
++    return RgDs_NativeIsMenuProcess();
++}
++
+ void Pc_MouseCursor_Draw(void)
+ {
+     POLY_FT4* poly;
+     s32       cx, cy;
+ 
+-    if (!Mc_Enabled() || !s_inView)
++    if (!Mc_Enabled() || !s_inView || Mc_HideArrow())
+         return;
+     /* A GL overlay dialog composites above this whole frame, so it draws the
+      * cursor itself (Pc_MouseCursor_SpriteRgba/GlRect); ours would sit under it. */
+@@ -388,7 +415,7 @@ int Pc_MouseCursor_GlRect(float vpW, float vpH, float* outX, float* outY, float*
+ {
+     float w, h, fbH;
+ 
+-    if (!Mc_Enabled() || !s_inView)
++    if (!Mc_Enabled() || !s_inView || Mc_HideArrow())
+         return 0;
+ 
+     /* The PSX draw is 16x16 framebuffer units; the framebuffer is 320 wide and
+diff --git a/pc_port/src/pc_retroachievements.c b/pc_port/src/pc_retroachievements.c
+index e01d060..e278c29 100644
+--- a/pc_port/src/pc_retroachievements.c
++++ b/pc_port/src/pc_retroachievements.c
+@@ -1436,5 +1436,7 @@ int         Pc_Ra_IsActive(void) { return 0; }
+ const char* Pc_Ra_StatusLine(void) { return ""; }
+ void        Pc_Ra_RequestBadge(const char* badgeName) { (void)badgeName; }
+ int         Pc_Ra_SnapshotAchievements(PcRaAch* out, int max) { (void)out; (void)max; return 0; }
++int         Pc_Ra_PreviewFirst(void) { return 0; }
++int         Pc_Ra_Why(const char* filter) { (void)filter; return 0; }
+ 
+ #endif /* SH_RETROACHIEVEMENTS */
+diff --git a/src/bodyprog/bodyprog_mapscreen_80066D90.c b/src/bodyprog/bodyprog_mapscreen_80066D90.c
+index f21ac70..d29dee3 100644
+--- a/src/bodyprog/bodyprog_mapscreen_80066D90.c
++++ b/src/bodyprog/bodyprog_mapscreen_80066D90.c
+@@ -16,6 +16,10 @@
+ #include "bodyprog/sound/sound_system.h"
+ #include "main/rng.h"
+ 
++#ifdef SH_PC_PORT
++#include "rgds_native.h"
++#endif
++
+ // Used by `func_80068CC0` and `GameState_PaperMapScreen_Update`.
+ // I think this is save file flags related to
+ // placing the markings on the map.
+@@ -248,6 +252,12 @@ void GameState_PaperMapScreen_Update(void) // 0x80066EB0
+             Fs_QueueWaitForEmpty();
+ 
+             g_IntervalVBlanks = 1;
++#ifdef SH_RGDS
++            /* RG DS bottom screen: no fade-in either; the map is there at once. */
++            if (RgDs_NativeIsMenuProcess())
++                ScreenFade_Reset();
++            else
++#endif
+             ScreenFade_Start(true, true, false);
+ 
+             g_GameWork.gameStateSteps[0] = 2;
+@@ -285,6 +295,10 @@ void GameState_PaperMapScreen_Update(void) // 0x80066EB0
+             }
+ 
+             func_800692A4(var_s6, var_s5, temp_s4);
++#ifdef SH_PC_PORT
++            /* RG DS bottom screen: touch buttons (close, zoom) in the menu's style. */
++            RgDs_NativeMapOverlayDraw(D_800AE770);
++#endif
+ 
+             if ((g_GameWork.gameStatePrev == GameState_InventoryScreen && g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.cancel) ||
+                 (g_GameWork.gameStatePrev != GameState_InventoryScreen && g_Controller0->clickedBtnFlags & (g_GameWorkPtr->config.controllerConfig.cancel |
+@@ -299,6 +313,15 @@ void GameState_PaperMapScreen_Update(void) // 0x80066EB0
+                     GsDrawOt(&g_OrderingTable0[g_ActiveBufferIdx]);
+                     func_80066E7C();
+                     GameFs_MapItemsTextureLoad(g_SavegamePtr->mapIdx);
++#ifdef SH_RGDS
++                    /* RG DS bottom screen: the original darkens the map here over 63
++                     * vblanks without presenting a frame. On PC that is a second of frozen
++                     * map plus a 63-layer GPU burst that also stalls the world's frame, on
++                     * every close. Close straight away; the item reads still complete. */
++                    if (RgDs_NativeIsMenuProcess())
++                        Fs_QueueWaitForEmpty();
++                    else
++#endif
+                     func_80066D90();
+                     ScreenFade_ResetTimestep();
+                 }
+@@ -1012,6 +1035,18 @@ bool func_80068CC0(s32 arg0) // 0x80068CC0
+             poly = GsOUT_PACKET_P;
+             setPolyG3(poly);
+ 
++#ifdef SH_RGDS
++            /* RG DS bottom screen: the same arrows, large enough to tap (rgds_native.h). */
++            if (RgDs_NativeIsMenuProcess())
++            {
++                s32 tip  = i != 0 ? RGDS_MAP_ARROW_TIP : -RGDS_MAP_ARROW_TIP;
++                s32 base = i != 0 ? RGDS_MAP_ARROW_BASE : -RGDS_MAP_ARROW_BASE;
++                setXY0Fast(poly, 0, tip);
++                setXY1Fast(poly, -RGDS_MAP_ARROW_HALF, base);
++                setXY2Fast(poly, RGDS_MAP_ARROW_HALF, base);
++            }
++            else
++#endif
+             if (i != 0)
+             {
+                 setXY0Fast(poly,  0, 216);
+diff --git a/src/bodyprog/gfx/bodyprog_80055028.c b/src/bodyprog/gfx/bodyprog_80055028.c
+index 3b9405c..f100f2c 100644
+--- a/src/bodyprog/gfx/bodyprog_80055028.c
++++ b/src/bodyprog/gfx/bodyprog_80055028.c
+@@ -249,6 +249,18 @@ static void Pc_FarOtAdd(void* prim, u32 key)
+ #define SH_ADDPRIM_LIT(ot, depth, shift, prim, sd, i0, i1, i2, i3) addPrim(&(ot)[((depth) >> (shift)) >> 2], (prim))
+ #endif
+ 
++#ifdef SH_RGDS
++/* RG DS: with resident_textures = 0 a chunk material whose VRAM page went to a nearer
++ * chunk gets the untextured sentinel (page 32, Model_MaterialUntexture). The sentinel
++ * still samples VRAM page 0 through the prim's old CLUT; upstream relies on that page
++ * being blank (index 0, transparent), but rows past the display rects are never
++ * blanked, so these prims came out as flat green/brown/white specks on door frames.
++ * Skip them outright. Prims without a material keep the original sentinel. */
++#define SH_RGDS_PRIM_PAGE_STOLEN(p) ((p)->field_6.bits.materialIdx != NO_VALUE && (p)->field_6.bits.field_6_0 == 32)
++#else
++#define SH_RGDS_PRIM_PAGE_STOLEN(p) 0
++#endif
++
+ #ifdef SH_PC_PORT
+ /* PGXP shadow-memory propagation (Step 3): after the drawer copies a vertex word
+  * from a GTE scratch slot (screenXy_0[idx], shadow-stored at gte_stsxy3c time)
+@@ -2940,6 +2952,10 @@ void Gfx_MeshDraw(s_MeshHeader* meshHdr, s_GteScratchData* scratchData, GsOT_TAG
+ 
+                 for (; prim < &meshHdr->primitives[meshHdr->primitiveCount]; prim++)
+                 {
++#ifdef SH_RGDS
++                    if (SH_RGDS_PRIM_PAGE_STOLEN(prim))
++                        continue;
++#endif
+                     *(s32*)&scratchData->field_380.s_0.field_10 = *(s32*)&prim->field_C;
+ #ifdef SH_PC_PORT
+                     PsyX_SetNextPrimSz(
+@@ -3198,6 +3214,10 @@ void Gfx_MeshDraw(s_MeshHeader* meshHdr, s_GteScratchData* scratchData, GsOT_TAG
+ 
+             for (; prim < &meshHdr->primitives[meshHdr->primitiveCount]; prim++)
+             {
++#ifdef SH_RGDS
++                if (SH_RGDS_PRIM_PAGE_STOLEN(prim))
++                    continue;
++#endif
+                 *(s32*)&scratchData->field_380.s_0.field_10 = *(s32*)&prim->field_C;
+ #ifdef SH_PC_PORT
+                 PsyX_SetNextPrimSz(
+@@ -3369,6 +3389,10 @@ void Gfx_MeshDraw(s_MeshHeader* meshHdr, s_GteScratchData* scratchData, GsOT_TAG
+ 
+         for (; prim < &meshHdr->primitives[meshHdr->primitiveCount]; prim++)
+         {
++#ifdef SH_RGDS
++            if (SH_RGDS_PRIM_PAGE_STOLEN(prim))
++                continue;
++#endif
+             *(s32*)&scratchData->field_380.s_0.field_10 = *(s32*)&prim->field_C;
+ #ifdef SH_PC_PORT
+             PsyX_SetNextPrimSz(
+@@ -3633,6 +3657,10 @@ __block1530:
+ 
+     for (; prim < &meshHdr->primitives[meshHdr->primitiveCount]; prim++)
+     {
++#ifdef SH_RGDS
++        if (SH_RGDS_PRIM_PAGE_STOLEN(prim))
++            continue;
++#endif
+ #ifdef SH_PC_PORT
+         _b1530Total++;
+ #endif
+@@ -3853,6 +3881,10 @@ __block19CC:
+ 
+     for (prim = meshHdr->primitives; prim < &meshHdr->primitives[meshHdr->primitiveCount]; prim++)
+     {
++#ifdef SH_RGDS
++        if (SH_RGDS_PRIM_PAGE_STOLEN(prim))
++            continue;
++#endif
+         *(s32*)&scratchData->field_380.s_0.field_10 = *(s32*)&prim->field_C;
+ 
+ #ifdef SH_PC_PORT
+diff --git a/src/bodyprog/gfx/bodyprog_bone_80044F14.c b/src/bodyprog/gfx/bodyprog_bone_80044F14.c
+index 5b59e4b..04eb43b 100644
+--- a/src/bodyprog/gfx/bodyprog_bone_80044F14.c
++++ b/src/bodyprog/gfx/bodyprog_bone_80044F14.c
+@@ -439,7 +439,14 @@ void func_80045534(s_Skeleton* skel, GsOT* ot, s32 arg2, GsCOORDINATE2* boneCoor
+                 int _hb = (u8)curBone->bone.idx;
+                 if (!(g_PcHideHarryFpsBody && (_hb == 2 || _hb >= 18)))
+                 {
++#ifdef SH_RGDS
++                    extern int g_PsyX_RgdsNoSeam; /* RG DS seam fill skips characters (PsyX_GPU.cpp) */
++                    g_PsyX_RgdsNoSeam++;
++#endif
+                     func_80057090(&curBone->bone.modelInfo, ot, arg2, &viewMat, &worldMat, arg5);
++#ifdef SH_RGDS
++                    g_PsyX_RgdsNoSeam--;
++#endif
+                 }
+             }
+ #else
+diff --git a/src/bodyprog/gfx/world_draw.c b/src/bodyprog/gfx/world_draw.c
+index b56129f..3a1f624 100644
+--- a/src/bodyprog/gfx/world_draw.c
++++ b/src/bodyprog/gfx/world_draw.c
+@@ -1106,7 +1106,16 @@ void WorldGfx_HeldItemDraw(void) // 0x8003D058
+         }
+ 
+         Vw_CoordToWorldAndViewMatrices(coord, &worldMat, &viewMat);
++#ifdef SH_RGDS
++        {
++            extern int g_PsyX_RgdsNoSeam; /* the held item is part of the character */
++            g_PsyX_RgdsNoSeam++;
++            func_80057090(&heldItem->bone.modelInfo, &g_OrderingTable0[g_ActiveBufferIdx], 1, &viewMat, &worldMat, 0);
++            g_PsyX_RgdsNoSeam--;
++        }
++#else
+         func_80057090(&heldItem->bone.modelInfo, &g_OrderingTable0[g_ActiveBufferIdx], 1, &viewMat, &worldMat, 0);
++#endif
+     }
+ }
+ 
+diff --git a/src/bodyprog/items/item_screens_2.c b/src/bodyprog/items/item_screens_2.c
+index 2ede127..5ef9a8a 100644
+--- a/src/bodyprog/items/item_screens_2.c
++++ b/src/bodyprog/items/item_screens_2.c
+@@ -17,6 +17,7 @@
+ #ifdef SH_PC_PORT
+ #include "pc_inventory_mouse.h"
+ #include "pc_mouse_cursor.h"
++#include "rgds_native.h"
+ #endif
+ 
+ static const s32 pad_rodata_80025EAC = 0;
+@@ -150,6 +151,12 @@ void GameState_ItemScreens_Update(void) // 0x8004C9B0
+             g_IntervalVBlanks = 1;
+             ScreenFade_Start(true, true, false);
+             g_ScreenFadeTimestep = Q12(3.0f);
++#ifdef SH_RGDS
++            /* RG DS bottom screen: back from the map without the fade-in, so the
++             * inventory takes input (and the next map button) at once. */
++            if (RgDs_NativeIsMenuProcess() && g_GameWork.gameStatePrev == GameState_PaperMapScreen)
++                ScreenFade_Reset();
++#endif
+ 
+             Game_RadioSoundStop();
+ 
+@@ -221,6 +228,9 @@ void GameState_ItemScreens_Update(void) // 0x8004C9B0
+             }
+ 
+             Gfx_Inventory_CmdOptionsDraw();
++#ifdef SH_PC_PORT
++            RgDs_NativeOverlayDraw();
++#endif
+ 
+             switch (g_GameWork.gameStateSteps[1])
+             {
+@@ -577,6 +587,7 @@ void Inventory_Logic(void) // 0x8004D518
+ #ifdef SH_PC_PORT
+     /* Must run before the directional flags are derived from g_Controller0. */
+     Pc_Inventory_MouseUpdate();
++    RgDs_NativeMenuInput();
+ #endif
+ 
+     Inventory_DirectionalInputSet();
+@@ -876,6 +887,16 @@ void Inventory_Logic(void) // 0x8004D518
+                     }
+                     Fs_QueueStartSeek(FILE_TIM_MP_0TOWN_TIM + g_PaperMapFileIdxs[g_SavegamePtr->paperMapIdx]);
+ 
++#ifdef SH_RGDS
++                    /* RG DS bottom screen: the map is used all the time during play,
++                     * so it opens without the fade to black; step 19 sees the fade
++                     * already finished and goes straight to the map screen. The fade
++                     * progress is still 0 from the last finished fade, so nothing
++                     * darkens in between. */
++                    if (RgDs_NativeIsMenuProcess())
++                        g_Screen_FadeStatus = SCREEN_FADE_STATUS(ScreenFadeState_FadeOutComplete, false);
++                    else
++#endif
+                     ScreenFade_Start(true, false, false);
+                     g_GameWork.gameStateSteps[1] = 19;
+                     g_GameWork.gameStateSteps[2] = 0;
+@@ -967,6 +988,10 @@ void Inventory_Logic(void) // 0x8004D518
+             {
+                 g_Inventory_SelectionBordersDraw = 1;
+ 
++#ifdef SH_PC_PORT
++                if (RgDs_NativeCommand(curItemIdx, g_SavegamePtr->items[curItemIdx].command_2, g_Inventory_CmdSelectedIdx)) break;
++#endif
++
+                 switch (g_SavegamePtr->items[curItemIdx].command_2)
+                 {
+                     case InvCmdId_OnOff:
+@@ -1287,6 +1312,21 @@ void Inventory_ItemUse(s32 inventoryItemIdx) // 0x8004E6D4
+     #undef playerExtra
+ }
+ 
++#ifdef SH_RGDS
++/* The original label positions are bar top + 112 (y) and prim x + 160 (x): single
++ * rows at -34, double rows at -42 / -26. Moved onto the larger RG DS rows. */
++static void Inv_CmdLabelPositionSet(s32 big, s32 x, s32 y)
++{
++    if (big)
++    {
++        x = RGDS_CMD_TEXT_X + 160;
++        y = (y == -34) ? (RGDS_CMD_Y0_SINGLE + 112)
++                       : (RGDS_CMD_Y0_DOUBLE + 112 + ((y == -26) ? RGDS_CMD_STEP : 0));
++    }
++    Gfx_StringSetPosition(x, y);
++}
++#endif
++
+ void Gfx_Inventory_CmdOptionsDraw(void) // 0x8004E864
+ {
+     s32      i;
+@@ -1295,6 +1335,12 @@ void Gfx_Inventory_CmdOptionsDraw(void) // 0x8004E864
+     s32      y0;
+     GsOT*    ot;
+     POLY_G4* poly;
++#ifdef SH_RGDS
++    s32      rgdsBig;
++    s32      x1;
++    s32      half;
++    s32      step;
++#endif
+ 
+     const char* STRS[] = {
+         "Use",
+@@ -1309,6 +1355,18 @@ void Gfx_Inventory_CmdOptionsDraw(void) // 0x8004E864
+ 
+     ot = &g_OrderingTable2[g_ActiveBufferIdx];
+ 
++#ifdef SH_RGDS
++    /* RG DS Plus bottom screen: the same labels and bars, 1.4x and further apart,
++     * so a fingertip can hit a row. Only the menu process; the layout numbers are
++     * shared with the touch hit-test (rgds_native.h). */
++    rgdsBig = RgDs_NativeIsMenuProcess();
++    if (rgdsBig)
++    {
++        Gfx_RgdsStringScaleSet(RGDS_CMD_SCALE_Q12);
++    }
++    #define Gfx_StringSetPosition(x, y) Inv_CmdLabelPositionSet(rgdsBig, (x), (y))
++#endif
++
+     if (g_Inventory_SelectionId >= InventorySelectionId_ItemCmd &&
+         g_Inventory_SelectionId <= InventorySelectionId_EquippedItemCmd)
+     {
+@@ -1394,6 +1452,11 @@ void Gfx_Inventory_CmdOptionsDraw(void) // 0x8004E864
+             break;
+     }
+ 
++#ifdef SH_RGDS
++    #undef Gfx_StringSetPosition
++    Gfx_RgdsStringScaleSet(Q12(1.0f));
++#endif
++
+     if (g_Inventory_SelectionId >= InventorySelectionId_ItemCmd &&
+         g_Inventory_SelectionId <= InventorySelectionId_EquippedItemCmd)
+     {
+@@ -1411,11 +1474,30 @@ void Gfx_Inventory_CmdOptionsDraw(void) // 0x8004E864
+                 break;
+         }
+ 
++#ifdef SH_RGDS
++        x1   = 136;
++        half = 6;
++        step = 16;
++        if (rgdsBig)
++        {
++            y0   = (y0 == -154) ? RGDS_CMD_Y0_DOUBLE : RGDS_CMD_Y0_SINGLE;
++            x1   = RGDS_CMD_X1;
++            half = RGDS_CMD_BAR_HALF;
++            step = RGDS_CMD_STEP;
++        }
++#endif
++
+         for (i = 0; i < 2; i++)
+         {
+             poly = (POLY_G4*)GsOUT_PACKET_P;
+ 
+             x0 = 56;
++#ifdef SH_RGDS
++            if (rgdsBig)
++            {
++                x0 = RGDS_CMD_X0;
++            }
++#endif
+ 
+             setPolyG4(poly);
+ 
+@@ -1434,11 +1516,19 @@ void Gfx_Inventory_CmdOptionsDraw(void) // 0x8004E864
+                 setRGB3(poly, Q8_COLOR(0.0f), Q8_COLOR(0.75f), Q8_COLOR(0.25f));
+             }
+ 
++#ifdef SH_RGDS
++            setXY4(poly,
++                   x0, (y0 + (i * half))       + ((u16)g_Inventory_CmdSelectedIdx * step),
++                   x0, (y0 + ((i + 1) * half)) + ((u16)g_Inventory_CmdSelectedIdx * step),
++                   x1, (y0 + (i * half))       + ((u16)g_Inventory_CmdSelectedIdx * step),
++                   x1, (y0 + ((i + 1) * half)) + ((u16)g_Inventory_CmdSelectedIdx * step));
++#else
+             setXY4(poly,
+                    x0,  (y0 + (i * 6))       + ((u16)g_Inventory_CmdSelectedIdx * 16),
+                    x0,  (y0 + ((i + 1) * 6)) + ((u16)g_Inventory_CmdSelectedIdx * 16),
+                    136, (y0 + (i * 6))       + ((u16)g_Inventory_CmdSelectedIdx * 16),
+                    136, (y0 + ((i + 1) * 6)) + ((u16)g_Inventory_CmdSelectedIdx * 16));
++#endif
+ 
+             addPrim(&ot->org[7], poly);
+             GsOUT_PACKET_P = (PACKET*)poly + sizeof(POLY_G4);
+diff --git a/src/bodyprog/items/item_screens_3.c b/src/bodyprog/items/item_screens_3.c
+index 6541e5a..9d73e6f 100644
+--- a/src/bodyprog/items/item_screens_3.c
++++ b/src/bodyprog/items/item_screens_3.c
+@@ -16,6 +16,7 @@
+ #include "pc_item_unq.h" /* Pc_ItemUnq_FromItemId: itemId -> UNQ file index */
+ #include "sh_log.h"
+ #include "pc_big_tmd.h" /* Pc_BigTmd_Resolve at the FS_BUFFER_5/8 consumers */
++#include "rgds_native.h"
+ #endif
+ 
+ const s32 pad_rodata_800262F8 = 0;
+@@ -2257,6 +2258,9 @@ void Gfx_Inventory_ItemDescriptionDraw(s32* selectedItemId) // 0x8005192C
+         case 2:
+         case 3:
+         case 4:
++#ifdef SH_PC_PORT
++        case 5:
++#endif
+             Gfx_StringSetPosition(68, 200);
+             Gfx_StringDraw(s_ItemName(g_SavegamePtr->items[idx].id_0), 100);
+             Gfx_StringSetPosition(30, 232);
+@@ -2274,6 +2278,13 @@ void Gfx_Inventory_ItemDescriptionDraw(s32* selectedItemId) // 0x8005192C
+                 case 4:
+                     Gfx_StringDraw(D_80027F14[1], 100);
+                     break;
++
++#ifdef SH_PC_PORT
++                /* RG DS bottom menu: the live world could not take the command. */
++                case 5:
++                    Gfx_StringDraw(RgDs_NativeStatusText(), 100);
++                    break;
++#endif
+             }
+ 
+             if (idx == g_Inventory_SelectedItemIdx)
+diff --git a/src/bodyprog/sound/sd_call.c b/src/bodyprog/sound/sd_call.c
+index ec61665..b2ccef9 100644
+--- a/src/bodyprog/sound/sd_call.c
++++ b/src/bodyprog/sound/sd_call.c
+@@ -487,6 +487,12 @@ u8 Sd_PlaySfx(u16 sfxId, q0_7 balance, u8 vol) // 0x80046048
+     }
+ 
+ #ifdef SH_PC_PORT
++    {
++        extern int RgDs_NativeForwardSfx(unsigned short id, int balance, unsigned char vol);
++        if (RgDs_NativeForwardSfx(sfxId, balance, vol))
++            return NO_VALUE;
++    }
++
+     /* Temporary: log every SPU SFX play so a looping sound (e.g. the good+
+      * ending's stuck Cybil-grunt / boss-attack loops) can be identified by id
+      * and given an explicit Sd_SfxStop on PC (no SPU voice-stealing here). */
+diff --git a/src/bodyprog/sys/game_main.c b/src/bodyprog/sys/game_main.c
+index 7db171e..351ee44 100644
+--- a/src/bodyprog/sys/game_main.c
++++ b/src/bodyprog/sys/game_main.c
+@@ -2,6 +2,7 @@
+ 
+ #ifdef SH_PC_PORT
+ #include "sh_log.h"
++#include "pc_host_pointer.h"
+ #include "pc_config.h"
+ #include "xa_player.h"
+ #include "pc_msg_voice.h"
+@@ -2226,6 +2227,10 @@ void MainLoop(void) // 0x80032EE0
+         Joy_ReadP1();
+         Demo_ControllerDataUpdate();
+ #ifdef SH_PC_PORT
++        {
++            extern void RgDs_NativeRestoreHeld(void);
++            RgDs_NativeRestoreHeld();
++        }
+         if (s_pcQoHeldStashValid)
+         {
+             g_Controller0->heldBtnFlags = s_pcQoHeldStash;
+@@ -2400,6 +2405,11 @@ void MainLoop(void) // 0x80032EE0
+             Pc_ExtraActionsUpdate();
+         }
+ 
++        {
++            extern void RgDs_Update(void);
++            RgDs_Update();
++        }
++
+         /* Rear Look (held): set g_PcRearLookActive for the TPS/OTS camera + head. */
+         {
+             extern void Pc_RearLookUpdate(void);
+@@ -2715,6 +2725,8 @@ void MainLoop(void) // 0x80032EE0
+             ML_TRACE("Fs_QueueUpdate");
+             Fs_QueueUpdate();
+         }
++#endif
++#ifdef SH_PC_PORT
+         s_sfFsqEnd = (unsigned int)SDL_GetTicks();
+ #endif
+ 
+@@ -3927,7 +3939,7 @@ void MainLoop(void) // 0x80032EE0
+                      * it the new chain terminator instead of just zeroing its
+                      * length (the old behaviour left cur->addr pointing at the
+                      * wild target, so DrawOTag would still chase it). */
+-                    if (next && ((uintptr_t)next < 0x1000 || (uintptr_t)next > (uintptr_t)0x7FFFFFFFFFFF)) {
++                    if (next && !Pc_HostPointerValid(next, 0x1000)) {
+                         static int s_badNextDumped = 0;
+                         if (!s_badNextDumped) {
+                             s_badNextDumped = 1;
+@@ -4029,7 +4041,7 @@ void MainLoop(void) // 0x80032EE0
+                 /* Accept heap packet buffer, OT array, OR any static/BSS primitive
+                  * (e.g. screen fade DR_MODE/TILE in D_800A8E5C/D_800A8E74).
+                  * Only reject null, very-low, or kernel-space addresses. */
+-                int curOk2 = (curAddr2 >= 0x1000 && curAddr2 <= (uintptr_t)0x7FFFFFFFFFFF);
++                int curOk2 = Pc_HostPointerValid(cur2, 0x1000);
+                 if (!curOk2) {
+                     static int s_ot2DumpedOnce = 0;
+                     if (!s_ot2DumpedOnce) {
+@@ -4053,7 +4065,7 @@ void MainLoop(void) // 0x80032EE0
+                     }
+                 }
+                 OT_TAG* next2 = (OT_TAG*)nextPrim(cur2);
+-                if (next2 && ((uintptr_t)next2 < 0x1000 || (uintptr_t)next2 > (uintptr_t)0x7FFFFFFFFFFF)) {
++                if (next2 && !Pc_HostPointerValid(next2, 0x1000)) {
+                     static int s_ot2BadNextDumped = 0;
+                     if (!s_ot2BadNextDumped) {
+                         s_ot2BadNextDumped = 1;
+@@ -4162,6 +4174,10 @@ void MainLoop(void) // 0x80032EE0
+             g_PsxGreyTag[5] = g_PsxPresentLastFrame;
+         }
+         PsyX_EndScene();
++        {
++            extern void RgDs_Present(void);
++            RgDs_Present();
++        }
+         /* Demand-driven texture-pack composes (pc_port/src/texpack_lazy.c). Runs
+          * HERE, after the OT submit and after the swap inside PsyX_EndScene,
+          * because it creates and REPLACES GL texture objects: ApplyHiresOverride
+diff --git a/src/bodyprog/text/text_draw.c b/src/bodyprog/text/text_draw.c
+index 14f5382..6b4aa29 100644
+--- a/src/bodyprog/text/text_draw.c
++++ b/src/bodyprog/text/text_draw.c
+@@ -232,6 +232,50 @@ s32        D_800C3920;
+ #ifdef SH_PC_PORT
+ /* Region hook (font_region.c): retail EUR ships STRING_COLORS[LightGrey] as
+  * (64,64,64) instead of the US (100,100,100). */
++#ifdef SH_RGDS
++/* RG DS Plus touch menus: Q12 size of Gfx_StringDraw's high-res glyphs, grown
++ * from the string's start position (layout and advances stay 1x, each glyph is
++ * mapped about that point). Q12(1.0) keeps the original path untouched. */
++static s32 s_RgdsStringScale = Q12(1.0f);
++
++void Gfx_RgdsStringScaleSet(s32 scaleQ12)
++{
++    s_RgdsStringScale = scaleQ12;
++}
++
++/* One scaled glyph, as Pc_MsgGlyphQuad: a SPRT cannot be resized, so both paths
++ * emit a POLY_FT4 (its UVs and page word match the game's own high-res FT4) from
++ * the packet cursor the glyph would have used. */
++static void Gfx_RgdsScaledGlyph(GsOT* ot, PACKET** lowResPacket, s32 x, s32 y,
++                                u32 u, u32 v, u32 clut, u32 page, u32 color)
++{
++    bool      hiRes = g_SysWork.enableHighResGlyphs;
++    POLY_FT4* poly  = (POLY_FT4*)(hiRes ? GsOUT_PACKET_P : *lowResPacket);
++    s32       yMul  = hiRes ? 2 : 1;
++    s32       ox    = g_StringPosition.vx;
++    s32       oy    = g_StringPosition.vy * yMul;
++    s32       x0    = ox + (((x - ox) * s_RgdsStringScale) >> 12);
++    s32       y0    = oy + ((((y * yMul) - oy) * s_RgdsStringScale) >> 12);
++    s32       w     = (FONT_12X16_GLYPH_SIZE_X * s_RgdsStringScale) >> 12;
++    s32       h     = ((hiRes ? g_FontLayout->hiResGlyphBottom : 15) * s_RgdsStringScale) >> 12;
++
++    setPolyFT4(poly);
++    setRGB0(poly, (s8)color, (s8)(color >> 8), (s8)(color >> 16));
++    setXY4(poly, x0, y0, x0, y0 + h, x0 + w, y0, x0 + w, y0 + h);
++
++    *((u32*)&poly->u0) = u + (v << 8) + (clut << 16);
++    *((u32*)&poly->u1) = u + (page << 16) + ((v + 15) << 8);
++    *((u16*)&poly->u2) = (u16)(u + FONT_12X16_GLYPH_SIZE_X + (v << 8));
++    *((u16*)&poly->u3) = (u16)(u + FONT_12X16_GLYPH_SIZE_X + ((v + 15) << 8));
++
++    addPrim(ot, poly);
++    if (hiRes)
++        GsOUT_PACKET_P = (PACKET*)poly + sizeof(POLY_FT4);
++    else
++        *lowResPacket = (PACKET*)poly + sizeof(POLY_FT4);
++}
++#endif
++
+ void Gfx_StringLightGreyColorPatch(unsigned char r, unsigned char g, unsigned char b)
+ {
+     STRING_COLORS[StringColorId_LightGrey] = COLOR_RGBC(r, g, b, PRIM_RECT | RECT_TEXTURE);
+@@ -456,6 +500,13 @@ bool Gfx_StringDraw(char* str, s32 strLength) // 0x8004A8E8
+                 u0         = (glyphIdx % FONT_12X16_ATLAS_COLUMN_COUNT) * FONT_12X16_GLYPH_SIZE_X;
+ 
+                 // Draw glyph sprite.
++#ifdef SH_RGDS
++                if (s_RgdsStringScale != Q12(1.0f))
++                {
++                    Gfx_RgdsScaledGlyph(ot, &packet, posX, drawY, u0, vTop, g_FontLayout->packedClut, page, glyphColor);
++                }
++                else
++#endif
+                 if (g_SysWork.enableHighResGlyphs)
+                 {
+                     glyphPoly = (POLY_FT4*)GsOUT_PACKET_P;
+diff --git a/src/bodyprog/view/vw_calc.c b/src/bodyprog/view/vw_calc.c
+index a3d99d2..e822ade 100644
+--- a/src/bodyprog/view/vw_calc.c
++++ b/src/bodyprog/view/vw_calc.c
+@@ -37,6 +37,7 @@ extern float g_PsxWorldVScale, g_PsxWorldVShift;
+ #include "bodyprog/math/math.h"
+ #ifdef SH_PC_PORT
+ #include "sh_log.h"
++#include "pc_host_pointer.h"
+ #endif
+ 
+ // Reference view transform?
+@@ -408,7 +409,7 @@ void Vw_CoordHierarchyMatrixCompute(GsCOORDINATE2* rootCoord, MATRIX* transformM
+      * truncated/uninitialised PSX pointer shows up as ~0 / non-canonical and
+      * derefs to a wild read (the bad-ending crash: super == -1). Treat any
+      * non-canonical link as end-of-chain instead of crashing. */
+-    #define COORD_PTR_OK(p) ((uintptr_t)(p) >= 0x10000ULL && (uintptr_t)(p) < 0x0000800000000000ULL)
++    #define COORD_PTR_OK(p) Pc_HostPointerValid((const void*)(p), 0x10000)
+     if (!COORD_PTR_OK(rootCoord))
+     {
+         if (rootCoord != NULL) {
+diff --git a/src/maps/map7_s03/map7_s03_2.c b/src/maps/map7_s03/map7_s03_2.c
+index 302bc42..4d1fc8d 100644
+--- a/src/maps/map7_s03/map7_s03_2.c
++++ b/src/maps/map7_s03/map7_s03_2.c
+@@ -1901,7 +1901,8 @@ void func_800D9114(s_800F3D48* arg0) // 0x800D9114
+  * with stale entries whose buffer was reused by cutscene TIM loads, leaving
+  * wild pointers -> func_800D88E8 / field_48 AV (CutsceneGlitch.log: map7_s03
+  * +0xEAB5 reading 0xffff...). Drop any entry that fails a canonical check. */
+-#define SH_F3D48_PTR_OK(p) ((uintptr_t)(p) >= 0x10000ULL && (uintptr_t)(p) < 0x0000800000000000ULL)
++#include "pc_host_pointer.h"
++#define SH_F3D48_PTR_OK(p) Pc_HostPointerValid((const void*)(p), 0x10000)
+ #define SH_F3D48_ENTRY_CORRUPT(e) \
+     (!SH_F3D48_PTR_OK((e)->ptr_0) || \
+      ((e)->field_4.field_44 != NULL && !SH_F3D48_PTR_OK((e)->field_4.field_44)) || \
+diff --git a/pc_port/include/pc_host_pointer.h b/pc_port/include/pc_host_pointer.h
+new file mode 100644
+index 0000000..2906908
+--- /dev/null
++++ b/pc_port/include/pc_host_pointer.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef PC_HOST_POINTER_H
++#define PC_HOST_POINTER_H
++#include <stdint.h>
++
++static inline int Pc_HostPointerValid(const void* pointer, uintptr_t minimum)
++{
++    uintptr_t address = (uintptr_t)pointer;
++#if defined(__aarch64__) && !defined(_WIN32)
++    /* Linux AArch64 stacks and PIE images can lie above x86-64's 47-bit limit. */
++    return address >= minimum && address < 0x0100000000000000ULL;
++#else
++    return address >= minimum && address < 0x0000800000000000ULL;
++#endif
++}
++#endif
+diff --git a/pc_port/include/rgds_inventory.h b/pc_port/include/rgds_inventory.h
+new file mode 100644
+index 0000000..e43c7a9
+--- /dev/null
++++ b/pc_port/include/rgds_inventory.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++
++int RgDs_Enabled(void);
++void RgDs_Init(void);
++void RgDs_Update(void);
++void RgDs_Present(void);
+diff --git a/pc_port/include/rgds_native.h b/pc_port/include/rgds_native.h
+new file mode 100644
+index 0000000..508d158
+--- /dev/null
++++ b/pc_port/include/rgds_native.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef RGDS_NATIVE_H
++#define RGDS_NATIVE_H
++/* Bottom-menu commands applied by the world process (pc_combat.c). */
++enum
++{
++    RgDsOp_None    = 0,
++    RgDsOp_Use     = 1,
++    RgDsOp_Equip   = 2,
++    RgDsOp_Unequip = 3,
++    RgDsOp_Reload  = 4,
++    RgDsOp_On      = 5,
++    RgDsOp_Off     = 6,
++    RgDsOp_Options = 7
++};
++/* Pc_RgdsItemAction results: 1 applied, 0 not applicable here (original
++ * "Can't use it here"), -1 the world cannot act now, -2 item no longer owned. */
++int RgDs_NativeInit(void);
++int RgDs_NativeActive(void);
++int RgDs_NativeIsMenuProcess(void);
++int RgDs_NativeMenuReady(void);
++int RgDs_NativeInputFocus(void);
++void RgDs_NativeUpdate(void);
++void RgDs_NativePresent(void);
++int RgDs_NativeCommand(int slot, int command, int row);
++int RgDs_NativeMenuInput(void);
++/* Bottom-screen Exit question: open, and its draw into the inventory frame. */
++int RgDs_NativeExitAsking(void);
++void RgDs_NativeOverlayDraw(void);
++void RgDs_NativeRestoreHeld(void);
++int RgDs_NativeForwardSfx(unsigned short id, int balance, unsigned char vol);
++int RgDs_NativeTakeTap(int* x, int* y);
++const char* RgDs_NativeStatusText(void);
++
++/* Bottom-screen command list, drawn larger for fingers (item_screens_2.c) and
++ * hit-tested with the same numbers (pc_inventory_mouse.c). Same units as the
++ * original 56..136 bars with 16-step rows; a label's string y is its bar's top
++ * + 112 and its string x is the prim x + 160, exactly as in the original. */
++#define RGDS_CMD_SCALE_Q12  5734 /* 1.4x the original glyphs */
++#define RGDS_CMD_X0         42
++#define RGDS_CMD_X1         146
++#define RGDS_CMD_TEXT_X     48
++#define RGDS_CMD_BAR_HALF   8
++#define RGDS_CMD_STEP       28
++#define RGDS_CMD_Y0_SINGLE  (-148)
++#define RGDS_CMD_Y0_DOUBLE  (-160)
++
++/* Bottom-screen paper map. Floor arrows in prim units of the 320x448 map screen
++ * (centre origin): a little larger than the original 200..216, still outside the
++ * plans, which reach about 197. The close / zoom buttons are square sprites drawn
++ * in the post-capture hook (rgds_map_icons.c), placed in fractions of the
++ * presented 1024x768 picture; their tap zones reach a little past the sprites. */
++#define RGDS_MAP_ARROW_TIP  221
++#define RGDS_MAP_ARROW_BASE 201
++#define RGDS_MAP_ARROW_HALF 12
++#define RGDS_MAP_BTN_W      (64.0f / 1024.0f)
++#define RGDS_MAP_BTN_H      (64.0f / 768.0f)
++#define RGDS_MAP_BTN_Y0     (692.0f / 768.0f)
++#define RGDS_MAP_CLOSE_X0   (12.0f / 1024.0f)
++#define RGDS_MAP_ZOOM_X0    (948.0f / 1024.0f)
++#define RGDS_MAP_HIT_Y0     (660.0f / 768.0f)
++#define RGDS_MAP_HIT_W      (110.0f / 1024.0f)
++void RgDs_NativeMapOverlayDraw(int zoomed);
++/* For the post-capture hook: 1 zoom-in or 2 zoom-out buttons this frame, else 0. */
++int RgDs_NativeMapIcons(void);
++void RgDs_MapIconsDraw(int zoomed);
++#endif
+diff --git a/pc_port/include/rgds_wayland.h b/pc_port/include/rgds_wayland.h
+new file mode 100644
+index 0000000..94edfd8
+--- /dev/null
++++ b/pc_port/include/rgds_wayland.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef RGDS_WAYLAND_H
++#define RGDS_WAYLAND_H
++#include <SDL2/SDL.h>
++int RgDs_WaylandInit(SDL_Window* window);
++SDL_Surface* RgDs_WaylandBegin(void);
++int RgDs_WaylandCommit(void);
++#endif
+diff --git a/pc_port/src/rgds_inventory.c b/pc_port/src/rgds_inventory.c
+new file mode 100644
+index 0000000..b99d3fb
+--- /dev/null
++++ b/pc_port/src/rgds_inventory.c
+@@ -0,0 +1,377 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include <SDL2/SDL.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include "game.h"
++#include "bodyprog/bodyprog.h"
++#include "bodyprog/items.h"
++#include "rgds_inventory.h"
++#include "rgds_wayland.h"
++#include "rgds_native.h"
++#include "lang_text.h"
++#include "sh_log.h"
++
++extern SDL_Window* g_window;
++extern int (*g_PsyX_EventHook)(SDL_Event* event);
++extern const unsigned char* DbgOverlay_Glyph(unsigned char ch);
++extern const char* INVENTORY_ITEM_NAMES[];
++extern int Pc_RgdsItemAction(unsigned char itemId, int reload);
++
++static SDL_Window* s_window;
++static SDL_Surface* s_surface;
++static int s_wayland;
++static int s_selectedId = -1, s_page, s_focus;
++static int s_pendingId = -1, s_pendingReload;
++static int s_pressed = -1;
++static unsigned s_frames, s_lastPresent, s_lastTrace;
++static char s_status[96] = "Touch an item, then USE. SELECT: inventory controls";
++
++int RgDs_Enabled(void)
++{
++    const char* value = getenv("SH_RGDS");
++#ifdef SH_RGDS
++    return !value || strcmp(value, "0") != 0;
++#else
++    return value && strcmp(value, "0") != 0;
++#endif
++}
++
++static const char* ItemName(int id)
++{
++    int index = id - 32;
++    const char* name;
++    if (index < 0 || index >= 195) return "Unknown item";
++    name = Pc_LangItemName(index);
++    if (!name) name = INVENTORY_ITEM_NAMES[index];
++    return name ? name : "Unknown item";
++}
++
++static int SlotForId(int id)
++{
++    int i;
++    for (i = 0; i < g_SavegamePtr->inventorySlotCount && i < INV_ITEM_COUNT_MAX; i++)
++        if (g_SavegamePtr->items[i].id_0 == id) return i;
++    return -1;
++}
++
++static int VisibleSlot(int index)
++{
++    int slot;
++    for (slot = 0; slot < g_SavegamePtr->inventorySlotCount && slot < INV_ITEM_COUNT_MAX; slot++) {
++        int id = g_SavegamePtr->items[slot].id_0;
++        if (id >= InvItemId_HealthDrink && id <= InvItemId_GasolineTank && index-- == 0) return slot;
++    }
++    return -1;
++}
++
++static int VisibleCount(void)
++{
++    int count = 0;
++    while (count < INV_ITEM_COUNT_MAX && VisibleSlot(count) >= 0) count++;
++    return count;
++}
++
++static int Hit(int x, int y)
++{
++    int row, column;
++    if (y >= 154 && y < 554 && x >= 24 && x < 1000) {
++        row = (y - 154) / 80;
++        column = (x - 24) / 492;
++        if (column < 2 && (x - 24) % 492 < 478 && (y - 154) % 80 < 70)
++            return row * 2 + column;
++    }
++    if (y >= 636 && y < 714) {
++        if (x >= 24 && x < 492) return 100;
++        if (x >= 508 && x < 1000) return 101;
++    }
++    if (y >= 92 && y < 140) {
++        if (x >= 728 && x < 856) return 102;
++        if (x >= 872 && x < 1000) return 103;
++    }
++    return -1;
++}
++
++static void Activate(int hit)
++{
++    int slot;
++    if (hit >= 0 && hit < 10) {
++        slot = VisibleSlot(s_page * 10 + hit);
++        if (slot >= 0) {
++            s_selectedId = g_SavegamePtr->items[slot].id_0;
++            snprintf(s_status, sizeof(s_status), "Selected: %.64s", ItemName(s_selectedId));
++        }
++    } else if (hit == 100 || hit == 101) {
++        if (s_selectedId >= 0) {
++            s_pendingId = s_selectedId;
++            s_pendingReload = hit == 101;
++        }
++    } else if (hit == 102 && s_page > 0) {
++        s_page--;
++    } else if (hit == 103 && (s_page + 1) * 10 < VisibleCount()) {
++        s_page++;
++    }
++}
++
++static int InventoryEvent(SDL_Event* event)
++{
++    Uint32 id = SDL_GetWindowID(s_window), eventId = 0;
++    int x = 0, y = 0, down = 0, up = 0;
++    switch (event->type) {
++        case SDL_WINDOWEVENT:
++            if (event->window.windowID != id) return 0;
++            if (event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
++                event->window.event == SDL_WINDOWEVENT_EXPOSED)
++                s_surface = NULL;
++            return 1;
++        case SDL_MOUSEBUTTONDOWN:
++        case SDL_MOUSEBUTTONUP:
++            eventId = event->button.windowID;
++            if (eventId != id) return 0;
++            if (event->button.which == SDL_TOUCH_MOUSEID) return 1;
++            x = event->button.x;
++            y = event->button.y;
++            down = event->type == SDL_MOUSEBUTTONDOWN;
++            up = event->type == SDL_MOUSEBUTTONUP;
++            break;
++        case SDL_FINGERDOWN:
++        case SDL_FINGERUP:
++        case SDL_FINGERMOTION:
++        {
++            int width, height;
++            if (event->tfinger.windowID != id) return 0;
++            SDL_GetWindowSize(s_window, &width, &height);
++            x = (int)(event->tfinger.x * width);
++            y = (int)(event->tfinger.y * height);
++            down = event->type == SDL_FINGERDOWN;
++            up = event->type == SDL_FINGERUP;
++            break;
++        }
++        case SDL_MOUSEMOTION:
++            return event->motion.windowID == id;
++        case SDL_MOUSEWHEEL:
++            if (event->wheel.windowID != id) return 0;
++            Activate(event->wheel.y > 0 ? 102 : 103);
++            return 1;
++        default:
++            return 0;
++    }
++    {
++        int width, height, hit;
++        SDL_GetWindowSize(s_window, &width, &height);
++        if (width <= 0 || height <= 0) return 1;
++        hit = Hit(x * 1024 / width, y * 768 / height);
++        if (down) s_pressed = hit;
++        if (up) {
++            if (hit == s_pressed) Activate(hit);
++            s_pressed = -1;
++        }
++    }
++    return 1;
++}
++
++void RgDs_Init(void)
++{
++    int i, display = SDL_GetNumVideoDisplays() > 1 ? 1 : 0;
++    SDL_Window* top;
++    SDL_GLContext context;
++    if (!RgDs_Enabled()) return;
++    if (RgDs_NativeInit()) return;
++    if (getenv("SH_RGDS_ROLE")) {
++        SH_DBG("[RGDS] native inventory bridge failed; stopping this process");
++        if (g_ShDebugLog) fflush(g_ShDebugLog);
++        exit(2);
++    }
++    top = SDL_GL_GetCurrentWindow();
++    context = SDL_GL_GetCurrentContext();
++    for (i = 0; i < SDL_GetNumVideoDisplays(); i++) {
++        const char* name = SDL_GetDisplayName(i);
++        SH_DBG("[RGDS] display %d: %s", i, name ? name : "unknown");
++        if (name && strstr(name, "DSI-1")) display = i;
++    }
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++    /* A second GPU-backed SDL surface can disturb PsyCross's cached GL state. */
++    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
++    SDL_SetWindowTitle(g_window, "Silent Hill RGDS [Top]");
++    s_window = SDL_CreateWindow("Silent Hill RGDS [Bottom]", SDL_WINDOWPOS_UNDEFINED_DISPLAY(display),
++                                SDL_WINDOWPOS_UNDEFINED_DISPLAY(display), 1024, 768,
++                                SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS);
++    if (!s_window) {
++        SH_DBG("[RGDS] bottom window failed: %s", SDL_GetError());
++        return;
++    }
++    g_PsyX_EventHook = InventoryEvent;
++    s_wayland = RgDs_WaylandInit(s_window);
++    if (top && context) SDL_GL_MakeCurrent(top, context);
++    SH_DBG("[RGDS] bottom window=%u on display=%d; inventory does not change game state", SDL_GetWindowID(s_window), display);
++}
++
++void RgDs_Update(void)
++{
++    int result, beforeHp, beforeCount, slot;
++    unsigned flags;
++    if (RgDs_NativeActive()) { RgDs_NativeUpdate(); return; }
++    if (!s_window) return;
++    s_frames++;
++    flags = g_Controller0->clickedBtnFlags;
++    if (g_GameWork.gameState == GameState_InGame) {
++        int reference = getenv("SH_RGDS_REFERENCE") != NULL;
++        if (!reference && (flags & ControllerFlag_Select)) s_focus = !s_focus;
++        if (s_focus) {
++            int n = VisibleCount(), selected;
++            for (selected = 0; selected < n; selected++)
++                if (g_SavegamePtr->items[VisibleSlot(selected)].id_0 == s_selectedId) break;
++            if (selected == n) selected = -1;
++            if (n > 0) {
++                if (selected < 0) selected = 0;
++                if (flags & ControllerFlag_LStickDown) selected = (selected + 2) % n;
++                if (flags & ControllerFlag_LStickUp) selected = (selected + n - (2 % n)) % n;
++                if (flags & ControllerFlag_LStickRight) selected = (selected + 1) % n;
++                if (flags & ControllerFlag_LStickLeft) selected = (selected + n - 1) % n;
++                s_selectedId = g_SavegamePtr->items[VisibleSlot(selected)].id_0;
++                s_page = selected / 10;
++                if (flags & ControllerFlag_Cross) Activate(100);
++                if (flags & ControllerFlag_Square) Activate(101);
++            }
++            if (flags & ControllerFlag_Circle) s_focus = 0;
++            g_Controller0->heldBtnFlags = 0;
++            g_Controller0->clickedBtnFlags = 0;
++            g_Controller0->releasedBtnFlags = 0;
++            g_Controller0->pulsedBtnFlags = 0;
++            g_Controller0->pulsedGuiBtnFlags = 0;
++            g_Controller0->sticks_20.rawData_0 = 0;
++            g_Controller0->sticks_24.rawData_0 = 0;
++        }
++        if (!reference) {
++            g_Controller0->heldBtnFlags &= ~ControllerFlag_Select;
++            g_Controller0->clickedBtnFlags &= ~ControllerFlag_Select;
++            g_Controller0->pulsedBtnFlags &= ~ControllerFlag_Select;
++            g_Controller0->pulsedGuiBtnFlags &= ~ControllerFlag_Select;
++        }
++    }
++    if (s_pendingId >= 0) {
++        int id = s_pendingId, reload = s_pendingReload;
++        s_pendingId = -1;
++        slot = SlotForId(id);
++        beforeCount = slot < 0 ? 0 : g_SavegamePtr->items[slot].count_1;
++        beforeHp = g_SysWork.playerWork.player.health;
++        result = Pc_RgdsItemAction((unsigned char)id, reload);
++        snprintf(s_status, sizeof(s_status), "%s: %.55s", result > 0 ? "Applied" : result < 0 ? "Busy - try again" : "Cannot use here", ItemName(id));
++        slot = SlotForId(id);
++        SH_DBG("[RGDS_ACTION] frame=%u item=%d reload=%d result=%d hp=%d->%d count=%d->%d state=%d sys=%d",
++               s_frames, id, reload, result, beforeHp, g_SysWork.playerWork.player.health,
++               beforeCount, slot < 0 ? 0 : g_SavegamePtr->items[slot].count_1,
++               g_GameWork.gameState, g_SysWork.sysState);
++    }
++}
++
++static void Rect(int x, int y, int w, int h, Uint32 color)
++{
++    SDL_Rect rect = { x * s_surface->w / 1024, y * s_surface->h / 768,
++                      w * s_surface->w / 1024, h * s_surface->h / 768 };
++    SDL_FillRect(s_surface, &rect, color);
++}
++
++static void Text(int x, int y, const char* text, int scale, Uint32 color, int maxChars)
++{
++    int n, row, column;
++    for (n = 0; text[n] && n < maxChars; n++) {
++        unsigned char ch = (unsigned char)text[n];
++        const unsigned char* glyph;
++        if (ch == '_') ch = ' ';
++        if (ch < 32 || ch > 126) ch = '?';
++        glyph = DbgOverlay_Glyph(ch);
++        for (row = 0; row < 8; row++)
++            for (column = 0; column < 8; column++)
++                if (glyph[row] & (1 << column))
++                    Rect(x + n * 8 * scale + column * scale, y + row * scale, scale, scale, color);
++    }
++}
++
++void RgDs_Present(void)
++{
++    Uint32 now, bg, card, white, green, muted;
++    int i, hp, selectedSlot, count;
++    char text[100];
++    SDL_Window* top;
++    SDL_GLContext context;
++    if (RgDs_NativeActive()) { RgDs_NativePresent(); return; }
++    if (!s_window) return;
++    now = SDL_GetTicks();
++    if (s_lastPresent && now - s_lastPresent < 100) return;
++    s_lastPresent = now;
++    top = SDL_GL_GetCurrentWindow();
++    context = SDL_GL_GetCurrentContext();
++    if (s_wayland) s_surface = RgDs_WaylandBegin();
++    else if (!s_surface) s_surface = SDL_GetWindowSurface(s_window);
++    if (!s_surface) {
++        if (now - s_lastTrace > 3000) {
++            SH_DBG("[RGDS] bottom surface unavailable: %s", SDL_GetError());
++            s_lastTrace = now;
++        }
++        if (top && context) SDL_GL_MakeCurrent(top, context);
++        return;
++    }
++    bg = SDL_MapRGB(s_surface->format, 14, 19, 19);
++    card = SDL_MapRGB(s_surface->format, 30, 40, 39);
++    white = SDL_MapRGB(s_surface->format, 228, 232, 215);
++    green = SDL_MapRGB(s_surface->format, 130, 188, 139);
++    muted = SDL_MapRGB(s_surface->format, 133, 145, 132);
++    SDL_FillRect(s_surface, NULL, bg);
++    Text(24, 22, "SILENT HILL / INVENTORY", 3, white, 40);
++    hp = g_SysWork.playerWork.player.health >> Q12_SHIFT;
++    if (hp < 0) hp = 0;
++    if (hp > 100) hp = 100;
++    snprintf(text, sizeof(text), "HP %3d   %s   FRAME %u", hp, s_focus ? "INVENTORY CONTROLS" : "LIVE", s_frames);
++    Text(24, 62, text, 2, green, 60);
++    Rect(24, 96, 650, 12, card);
++    Rect(24, 96, hp * 650 / 100, 12, green);
++    Text(24, 122, "WORLD CONTINUES WHILE YOU USE ITEMS", 2, muted, 47);
++    Rect(728, 92, 128, 48, card);
++    Rect(872, 92, 128, 48, card);
++    Text(746, 108, "< PREV", 2, white, 7);
++    Text(890, 108, "NEXT >", 2, white, 7);
++    count = VisibleCount();
++    if (s_page * 10 >= count) s_page = 0;
++    for (i = 0; i < 10; i++) {
++        int slot = VisibleSlot(s_page * 10 + i);
++        int x = 24 + (i % 2) * 492, y = 154 + (i / 2) * 80;
++        int id;
++        if (slot < 0) break;
++        id = g_SavegamePtr->items[slot].id_0;
++        Rect(x, y, 478, 70, id == s_selectedId ? green : card);
++        Text(x + 12, y + 10, ItemName(id), 2, id == s_selectedId ? bg : white, 28);
++        snprintf(text, sizeof(text), "COUNT %u%s", g_SavegamePtr->items[slot].count_1,
++                 id == g_SavegamePtr->equippedWeapon ? "   EQUIPPED" : "");
++        Text(x + 12, y + 40, text, 2, id == s_selectedId ? bg : muted, 28);
++    }
++    if (count == 0) Text(24, 200, "No items yet. Start or load a game above.", 2, muted, 60);
++    selectedSlot = SlotForId(s_selectedId);
++    Text(24, 572, s_status, 2, white, 60);
++    snprintf(text, sizeof(text), "PAGE %d   ITEMS %d   %s", s_page + 1, count,
++             g_GameWork.gameState == GameState_InGame ? "GAMEPLAY" : "WAITING FOR GAMEPLAY");
++    Text(24, 606, text, 2, muted, 60);
++    Rect(24, 636, 468, 78, selectedSlot >= 0 ? green : card);
++    Rect(508, 636, 492, 78, card);
++    Text(70, 662, "USE / EQUIP / TOGGLE", 2, selectedSlot >= 0 ? bg : muted, 24);
++    Text(630, 662, "RELOAD", 3, white, 12);
++    Text(24, 738, "SELECT: controls  A: use  X: reload  B: back", 2, muted, 60);
++    {
++        int result = s_wayland ? RgDs_WaylandCommit() : SDL_UpdateWindowSurface(s_window);
++        static int reported;
++        if (!reported || result < 0) {
++            SH_DBG("[RGDS_SURFACE] %dx%d format=%s update=%d error=%s top=%u context=%p", s_surface->w, s_surface->h,
++                   SDL_GetPixelFormatName(s_surface->format->format), result, result < 0 ? SDL_GetError() : "none",
++                   top ? SDL_GetWindowID(top) : 0, context);
++            reported = 1;
++        }
++    }
++    if (top && context && SDL_GL_MakeCurrent(top, context) < 0)
++        SH_DBG("[RGDS] restore GL context failed: %s", SDL_GetError());
++    if (now - s_lastTrace >= 3000) {
++        SH_DBG("[RGDS_LIVE] frame=%u state=%d sys=%d hp=%d items=%d selected=%d focus=%d time=%d weapon=%d toggles=%d",
++               s_frames, g_GameWork.gameState, g_SysWork.sysState, hp, count, s_selectedId, s_focus,
++               g_SavegamePtr->gameplayTimer, g_SavegamePtr->equippedWeapon, g_SavegamePtr->itemToggleFlags);
++        s_lastTrace = now;
++    }
++}
+diff --git a/pc_port/src/rgds_native.c b/pc_port/src/rgds_native.c
+new file mode 100644
+index 0000000..68d99fc
+--- /dev/null
++++ b/pc_port/src/rgds_native.c
+@@ -0,0 +1,956 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "rgds_native.h"
++#if defined(SH_RGDS) && defined(__linux__)
++#include <SDL2/SDL.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <stdio.h>
++#include <errno.h>
++#include <time.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <signal.h>
++#include "game.h"
++#include "bodyprog/bodyprog.h"
++#include "bodyprog/item_screens.h"
++#include "bodyprog/player.h"
++#include "bodyprog/sound/sound_system.h"
++#include "map_registry.h"
++#include "pc_config.h"
++#include "bodyprog/math/math.h"
++#include "bodyprog/screen/screen_data.h"
++#include "bodyprog/screen/screen_fade.h"
++#include "bodyprog/text/text_draw.h"
++#include "lang_text.h"
++#include "pc_mouse_cursor.h"
++#include "sh_log.h"
++
++extern SDL_Window* g_window;
++extern int Pc_RgdsItemAction(unsigned char id, int operation);
++extern void Pc_RgdsPublishAmmo(s_Savegame* save);
++
++#define RGDS_BRIDGE_VERSION    2
++#define RGDS_SFX_RING          16
++#define RGDS_REQUEST_EXPIRY_MS 1500
++
++typedef struct {
++    s32 posX, posY, posZ, rotY;
++    u8  flashlightOn, flashlightUnavailable, darkness, light0, light1;
++    u8  mapRequest; /* bumped by the world: open the map on the bottom screen */
++    u8  pad[2];
++} RgdsWorld;
++
++typedef struct {
++    _Atomic unsigned sequence, request, acknowledged, focus;
++    _Atomic unsigned quit, sfxWrite, sfxRead;
++    unsigned parentHeld, workerFrames, version;
++    _Atomic unsigned workerState;
++    int parentPid, hp, gameState, sysState, result, item, operation;
++    s_Savegame save;
++    RgdsWorld world;
++    unsigned requestTime;
++    unsigned sfx[RGDS_SFX_RING];
++} NativeBridge;
++/* Both processes share this layout; keep the offsets stable. */
++_Static_assert(sizeof(unsigned) == 4 && offsetof(NativeBridge, save) == 72 &&
++               offsetof(NativeBridge, world) == 708 && offsetof(NativeBridge, requestTime) == 732 &&
++               offsetof(NativeBridge, sfx) == 736 && sizeof(NativeBridge) == 800, "RGDS shared-state ABI changed");
++
++static NativeBridge* s_bridge;
++static int s_worker, s_opened, s_loadedMap = -1;
++/* Bottom-screen Exit question (drawn with the inventory's own bars and font). */
++static int s_exitAsk, s_exitYes;
++static unsigned s_exitAskSince;
++/* Map button in the world -> the original map on the bottom screen. */
++static u8 s_mapRequests, s_mapSeen;
++static int s_mapSeenValid, s_mapFromWorld, s_mapShown;
++static unsigned s_mapAskedAt, s_mapPrevSelection, s_mapWaitSince;
++static unsigned s_frames, s_lastTrace;
++static unsigned s_parentFocus, s_parentSuppress, s_workerFocus, s_workerSuppress;
++static unsigned s_pending, s_pendingOp, s_pendingSince, s_quitSince;
++static Uint64 s_lastPresent;
++static _Atomic unsigned s_lastInput, s_tapPending;
++static _Atomic int s_tapX, s_tapY;
++static int s_menuFps = 60, s_idleFps = 30;
++
++static unsigned NowMs(void)
++{
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (unsigned)(now.tv_sec * 1000u + now.tv_nsec / 1000000);
++}
++
++int RgDs_NativeActive(void) { return s_bridge != NULL; }
++int RgDs_NativeIsMenuProcess(void) { return s_bridge != NULL && s_worker; }
++int RgDs_NativeMenuReady(void) { return s_bridge != NULL && s_worker && s_opened; }
++int RgDs_NativeInputFocus(void) { return s_bridge && (s_worker || atomic_load(&s_bridge->focus)); }
++
++/* Only the bottom process watches: SDL's polled mouse state never shows a tap that
++ * starts and ends between two frames, and touch is the bottom screen's main input. */
++static int SDLCALL WorkerEventWatch(void* data, SDL_Event* event)
++{
++    (void)data;
++    switch (event->type)
++    {
++        case SDL_MOUSEBUTTONDOWN:
++            if (event->button.button == SDL_BUTTON_LEFT)
++            {
++                atomic_store(&s_tapX, event->button.x);
++                atomic_store(&s_tapY, event->button.y);
++                atomic_store(&s_tapPending, 1);
++            }
++            /* fall through */
++        case SDL_MOUSEBUTTONUP:
++        case SDL_MOUSEMOTION:
++        case SDL_FINGERDOWN:
++        case SDL_FINGERUP:
++        case SDL_FINGERMOTION:
++            atomic_store(&s_lastInput, NowMs());
++            break;
++        case SDL_CONTROLLERBUTTONDOWN:
++        case SDL_CONTROLLERAXISMOTION:
++            if (s_bridge && atomic_load(&s_bridge->focus))
++                atomic_store(&s_lastInput, NowMs());
++            break;
++    }
++    return 1;
++}
++
++static int EnvInt(const char* name, int fallback, int low, int high)
++{
++    const char* value = getenv(name);
++    int number;
++    if (!value || !*value) return fallback;
++    number = atoi(value);
++    return number < low ? low : number > high ? high : number;
++}
++
++int RgDs_NativeInit(void)
++{
++    const char* role = getenv("SH_RGDS_ROLE");
++    const char* path = getenv("SH_RGDS_BRIDGE");
++    int fd, i;
++    FILE* file = NULL;
++    if (!role || !path) return 0;
++    s_worker = !strcmp(role, "inventory");
++    /* PsyCross defines open/close for PS1 memory cards, even on Linux. */
++    for (i = 0; i < 300 && !file; i++) {
++        file = fopen(path, s_worker ? "r+b" : "w+b");
++        if (file && s_worker) {
++            struct stat info;
++            if (fstat(fileno(file), &info) < 0 || info.st_size < (off_t)sizeof(NativeBridge)) {
++                fclose(file);
++                file = NULL;
++            }
++        }
++        if (!file && s_worker) SDL_Delay(50);
++        else if (!file) break;
++    }
++    if (!file) { SH_DBG("[RGDS_NATIVE] cannot open bridge: %s", strerror(errno)); return 0; }
++    fd = fileno(file);
++    if (!s_worker && (fchmod(fd, 0600) < 0 || ftruncate(fd, sizeof(NativeBridge)) < 0)) { fclose(file); return 0; }
++    s_bridge = mmap(NULL, sizeof(NativeBridge), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    fclose(file);
++    if (s_bridge == MAP_FAILED) { s_bridge = NULL; return 0; }
++    if (!s_worker) {
++        memset(s_bridge, 0, sizeof(*s_bridge));
++        s_bridge->parentPid = getpid();
++        s_bridge->version = RGDS_BRIDGE_VERSION;
++    } else if (s_bridge->version != RGDS_BRIDGE_VERSION) {
++        SH_DBG("[RGDS_NATIVE] bridge version %u, expected %u", s_bridge->version, RGDS_BRIDGE_VERSION);
++        munmap(s_bridge, sizeof(NativeBridge));
++        s_bridge = NULL;
++        return 0;
++    }
++    if (s_worker) {
++        s_menuFps = EnvInt("SH_RGDS_MENU_FPS", 60, 15, 60);
++        s_idleFps = EnvInt("SH_RGDS_MENU_IDLE_FPS", 30, 5, s_menuFps);
++        SDL_AddEventWatch(WorkerEventWatch, NULL);
++    }
++    SDL_SetWindowTitle(g_window, s_worker ? "Silent Hill RGDS [Bottom]" : "Silent Hill RGDS [Top]");
++    SH_DBG("[RGDS_NATIVE] role=%s pid=%d abi=%d menu_fps=%d idle_fps=%d; original menu renderer, shared live state",
++           role, (int)getpid(), RGDS_BRIDGE_VERSION, s_menuFps, s_idleFps);
++    return 1;
++}
++
++/* Joy_ControllerDataUpdate derives the next click edges from last frame's
++ * heldBtnFlags. Clearing or stripping them here made a held Select read as a fresh
++ * click every frame (the focus flipped back and forth for as long as it was held),
++ * so the real value is put back before the next update, as the quick-options
++ * overlay does with s_pcQoHeldStash. */
++static unsigned s_realHeld;
++static int s_realHeldValid;
++
++void RgDs_NativeRestoreHeld(void)
++{
++    if (!s_realHeldValid) return;
++    g_Controller0->heldBtnFlags = s_realHeld;
++    s_realHeldValid = 0;
++}
++
++static void ClearPad(void)
++{
++    g_Controller0->heldBtnFlags = g_Controller0->clickedBtnFlags = g_Controller0->releasedBtnFlags = 0;
++    g_Controller0->pulsedBtnFlags = g_Controller0->pulsedGuiBtnFlags = 0;
++    g_Controller0->sticks_20.rawData_0 = g_Controller0->sticks_24.rawData_0 = 0;
++}
++
++static void StripPad(unsigned mask)
++{
++    g_Controller0->heldBtnFlags &= ~mask;
++    g_Controller0->clickedBtnFlags &= ~mask;
++    g_Controller0->releasedBtnFlags &= ~mask;
++    g_Controller0->pulsedBtnFlags &= ~mask;
++    g_Controller0->pulsedGuiBtnFlags &= ~mask;
++}
++
++/* Both processes read the same physical pad. A button still held when focus moves
++ * belongs to the screen that had it, so the other side ignores it until release. */
++static unsigned SuppressHeld(unsigned* suppress, unsigned* lastFocus, unsigned focus, unsigned mine)
++{
++    if (focus != *lastFocus) {
++        *suppress = g_Controller0->heldBtnFlags;
++        *lastFocus = focus;
++    }
++    *suppress &= g_Controller0->heldBtnFlags;
++    if (focus == mine) StripPad(*suppress);
++    return *suppress;
++}
++
++static void PublishWorld(void)
++{
++    RgdsWorld* world = &s_bridge->world;
++    world->posX = g_SysWork.playerWork.player.position.vx;
++    world->posY = g_SysWork.playerWork.player.position.vy;
++    world->posZ = g_SysWork.playerWork.player.position.vz;
++    world->rotY = g_SysWork.playerWork.player.rotation.vy;
++    world->flashlightOn = g_SysWork.field_2388.isFlashlightOn_15;
++    world->flashlightUnavailable = g_SysWork.field_2388.isFlashlightUnavailable_16;
++    world->darkness = g_SysWork.field_2388.field_154.effectsInfo_0.field_0.s_field_0.field_0;
++    world->light0 = g_SysWork.field_2388.field_1C[0].effectsInfo_0.field_0.s_field_0.field_0;
++    world->light1 = g_SysWork.field_2388.field_1C[1].effectsInfo_0.field_0.s_field_0.field_0;
++    world->mapRequest = s_mapRequests;
++}
++
++static void ApplyWorld(const RgdsWorld* world)
++{
++    g_SysWork.playerWork.player.position.vx = world->posX;
++    g_SysWork.playerWork.player.position.vy = world->posY;
++    g_SysWork.playerWork.player.position.vz = world->posZ;
++    g_SysWork.playerWork.player.rotation.vy = world->rotY;
++    g_SysWork.field_2388.isFlashlightOn_15 = world->flashlightOn;
++    g_SysWork.field_2388.isFlashlightUnavailable_16 = world->flashlightUnavailable;
++    g_SysWork.field_2388.field_154.effectsInfo_0.field_0.s_field_0.field_0 = world->darkness;
++    g_SysWork.field_2388.field_1C[0].effectsInfo_0.field_0.s_field_0.field_0 = world->light0;
++    g_SysWork.field_2388.field_1C[1].effectsInfo_0.field_0.s_field_0.field_0 = world->light1;
++}
++
++static int ParentOpenOptions(void)
++{
++    if (g_GameWork.gameState != GameState_InGame || g_SysWork.sysState != SysState_Gameplay ||
++        g_Player_DisableControl || Player_IsAttacking() == true)
++        return -1;
++    /* The same transition the original "option" button takes from gameplay. */
++    SysWork_StateSetNext(SysState_OptionsMenu);
++    atomic_store(&s_bridge->focus, 0);
++    return 1;
++}
++
++/* rgds_boot_console: a test start (e.g. "givemap all" in a mid-game scene) without
++ * a keyboard for the PC console. Once, on the first gameplay frame of the world. */
++static void ParentBootConsole(void)
++{
++    static int done;
++    extern void Pc_ConsoleExec(const char* line);
++    char line[sizeof(g_PcConfig.rgdsBootConsole)];
++    char* part;
++    char* next;
++    size_t i;
++
++    if (done || !g_PcConfig.rgdsBootConsole[0] || g_GameWork.gameState != GameState_InGame ||
++        g_SysWork.sysState != SysState_Gameplay)
++        return;
++    done = 1;
++    for (i = 0; i < sizeof(line) - 1 && g_PcConfig.rgdsBootConsole[i]; i++)
++        line[i] = (char)toupper((unsigned char)g_PcConfig.rgdsBootConsole[i]);
++    line[i] = '\0';
++    for (part = line; part; part = next) {
++        next = strchr(part, ';');
++        if (next) *next++ = '\0';
++        while (*part == ' ') part++;
++        if (*part) {
++            SH_DBG("[RGDS_NATIVE] boot console: %s", part);
++            Pc_ConsoleExec(part);
++        }
++    }
++}
++
++static void ParentUpdate(void)
++{
++    unsigned request = atomic_load_explicit(&s_bridge->request, memory_order_acquire);
++    unsigned focus, read, write;
++
++    if (atomic_load(&s_bridge->quit)) {
++        SH_DBG("[RGDS_NATIVE] Exit confirmed on the bottom screen; closing both processes");
++        unlink(getenv("SH_RGDS_BRIDGE"));
++        if (g_ShDebugLog) fflush(g_ShDebugLog);
++        exit(0);
++    }
++    if (request != atomic_load(&s_bridge->acknowledged)) {
++        int item = s_bridge->item, op = s_bridge->operation;
++        int before = g_SysWork.playerWork.player.health;
++        int weapon = g_SavegamePtr->equippedWeapon, toggles = g_SavegamePtr->itemToggleFlags;
++        unsigned age = NowMs() - s_bridge->requestTime;
++        if (age > RGDS_REQUEST_EXPIRY_MS) s_bridge->result = -1;
++        else if (op == RgDsOp_Options) s_bridge->result = ParentOpenOptions();
++        else s_bridge->result = Pc_RgdsItemAction(item, op);
++        SH_DBG("[RGDS_NATIVE_ACTION] request=%u item=%d op=%d result=%d age=%ums hp=%d->%d weapon=%d->%d toggles=%d->%d state=%d sys=%d time=%d",
++               request, item, op, s_bridge->result, age, before, g_SysWork.playerWork.player.health, weapon,
++               g_SavegamePtr->equippedWeapon, toggles, g_SavegamePtr->itemToggleFlags,
++               g_GameWork.gameState, g_SysWork.sysState, g_SavegamePtr->gameplayTimer);
++        atomic_store_explicit(&s_bridge->acknowledged, request, memory_order_release);
++    }
++
++    write = atomic_load_explicit(&s_bridge->sfxWrite, memory_order_acquire);
++    for (read = atomic_load(&s_bridge->sfxRead); read != write; read++) {
++        unsigned sfx = s_bridge->sfx[read % RGDS_SFX_RING];
++        Sd_PlaySfx((u16)(sfx & 0xFFFF), (s8)((sfx >> 16) & 0xFF), (u8)(sfx >> 24));
++    }
++    atomic_store_explicit(&s_bridge->sfxRead, write, memory_order_release);
++
++    ParentBootConsole();
++    s_bridge->parentHeld = g_Controller0->heldBtnFlags;
++    if (g_GameWork.gameState == GameState_InGame) {
++        if (g_Controller0->clickedBtnFlags & ControllerFlag_Select)
++            SH_DBG("[RGDS_NATIVE_FOCUS] Select: pad now drives the %s",
++                   atomic_fetch_xor(&s_bridge->focus, 1) ? "world" : "bottom menu");
++        StripPad(ControllerFlag_Select);
++        focus = atomic_load(&s_bridge->focus);
++        if (!focus && g_PcConfig.rgdsMapBottom && g_SysWork.sysState == SysState_Gameplay &&
++            (g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.map)) {
++            /* RG DS: the map button shows the original map on the bottom screen in
++             * place of the inventory instead of pausing the world on the top one.
++             * Only when the bottom menu sits in its inventory; otherwise the
++             * original top-screen map runs as before. */
++            unsigned worker = atomic_load(&s_bridge->workerState);
++            int      state  = (int)(worker >> 24);
++            if (state == GameState_InventoryScreen || state == GameState_PaperMapScreen) {
++                /* Opens the map from the inventory, closes it from the map; the
++                 * bottom process ignores it mid-transition. The pad stays with
++                 * Harry, so he keeps walking while the map follows him. */
++                StripPad(g_GameWorkPtr->config.controllerConfig.map);
++                s_mapRequests++;
++                SH_DBG("[RGDS_NATIVE_MAP] map button on the bottom screen (request %u, bottom state %d)", s_mapRequests, state);
++            }
++        }
++        SuppressHeld(&s_parentSuppress, &s_parentFocus, focus, 0);
++        if (focus) {
++            /* Start stays the world's pause (and unpause) whichever screen the
++             * pad drives; the bottom menu has no use for it. */
++            unsigned pause = g_Controller0->clickedBtnFlags & g_GameWorkPtr->config.controllerConfig.pause & ControllerFlag_Start;
++            ClearPad();
++            if (g_SysWork.sysState == SysState_Gameplay || g_SysWork.sysState == SysState_GamePaused)
++                g_Controller0->clickedBtnFlags = pause;
++        }
++    }
++
++    atomic_fetch_add_explicit(&s_bridge->sequence, 1, memory_order_acq_rel);
++    s_bridge->save = *g_SavegamePtr;
++    Pc_RgdsPublishAmmo(&s_bridge->save);
++    s_bridge->hp = g_SysWork.playerWork.player.health;
++    s_bridge->gameState = g_GameWork.gameState;
++    s_bridge->sysState = g_SysWork.sysState;
++    PublishWorld();
++    atomic_fetch_add_explicit(&s_bridge->sequence, 1, memory_order_release);
++}
++
++static void SyncCombatFromSave(void)
++{
++    int i;
++    g_Inventory_EquippedItem = g_SavegamePtr->equippedWeapon;
++    g_SysWork.playerCombat.weaponAttack = g_SavegamePtr->equippedWeapon ? g_SavegamePtr->equippedWeapon + 0x80 : NO_VALUE;
++    g_SysWork.playerCombat.weaponInventoryIdx = NO_VALUE;
++    for (i = 0; i < g_SavegamePtr->inventorySlotCount; i++)
++        if (g_SavegamePtr->items[i].id_0 == g_SavegamePtr->equippedWeapon) {
++            g_SysWork.playerCombat.weaponInventoryIdx = i;
++            g_SysWork.playerCombat.currentWeaponAmmo = g_SavegamePtr->items[i].count_1;
++        }
++    for (i = 0; i < g_SavegamePtr->inventorySlotCount; i++)
++        if (g_SavegamePtr->items[i].id_0 == g_SavegamePtr->equippedWeapon + 32)
++            g_SysWork.playerCombat.totalWeaponAmmo = g_SavegamePtr->items[i].count_1;
++}
++
++static void LoadMenuResources(int mapIdx)
++{
++    MapRegistry_Load(mapIdx);
++    GameFs_Tim00TIMLoad();
++    GameFs_MapItemsModelLoad(mapIdx);
++    Fs_QueueWaitForEmpty();
++    s_loadedMap = mapIdx;
++}
++
++static int ReadSnapshot(s_Savegame* save, int* hp, RgdsWorld* world, int* gameState)
++{
++    int attempt;
++    for (attempt = 0; attempt < 8; attempt++) {
++        unsigned a = atomic_load_explicit(&s_bridge->sequence, memory_order_acquire);
++        if (a & 1) continue;
++        *save = s_bridge->save;
++        *hp = s_bridge->hp;
++        *world = s_bridge->world;
++        *gameState = s_bridge->gameState;
++        atomic_thread_fence(memory_order_acquire);
++        if (a == atomic_load_explicit(&s_bridge->sequence, memory_order_acquire)) return 1;
++    }
++    return 0;
++}
++
++static void ForwardSfx(u16 id, s32 balance, u8 vol);
++
++static void FinishCommand(int result)
++{
++    s_pending = 0;
++    if (s_pendingOp == RgDsOp_Options) {
++        ForwardSfx(result > 0 ? Sfx_MenuConfirm : Sfx_MenuError, 64, 64);
++        return;
++    }
++    g_Inventory_SelectionId = InventorySelectionId_Item;
++    g_Inventory_SelectionBordersDraw = 1;
++    g_Inventory_CmdSelectedIdx = 0;
++    if (result > 0) {
++        ForwardSfx(Sfx_MenuConfirm, 64, 64);
++        return;
++    }
++    ForwardSfx(Sfx_MenuError, 64, 64);
++    /* 3 is the original "Can't use it here." line; 5 is the RG DS busy line. */
++    SysWork_StateStepSet(1, result == 0 && s_pendingOp == RgDsOp_Use ? 3 : 5);
++}
++
++static void WorkerUpdate(void)
++{
++    s_Savegame save;
++    RgdsWorld world;
++    int hp = 0, parentState = 0, valid;
++    unsigned focus;
++
++    if (s_bridge->parentPid && kill(s_bridge->parentPid, 0) < 0) exit(0);
++    s_bridge->workerFrames++;
++    if (atomic_load(&s_bridge->quit)) {
++        /* The world closes itself; a parent the launcher has not reaped yet still
++         * answers kill(0), so do not wait for it forever. */
++        if (!s_quitSince) s_quitSince = NowMs();
++        else if (NowMs() - s_quitSince > 3000) exit(0);
++        ClearPad();
++        return;
++    }
++
++    focus = atomic_load(&s_bridge->focus);
++    if (!focus) ClearPad();
++    StripPad(ControllerFlag_Select | ControllerFlag_Start);
++    SuppressHeld(&s_workerSuppress, &s_workerFocus, focus, 1);
++
++    if (!s_opened && g_GameWork.gameState == GameState_MainMenu &&
++        ReadSnapshot(&save, &hp, &world, &parentState) &&
++        save.inventorySlotCount >= 8 && parentState == GameState_InGame) {
++        *g_SavegamePtr = save;
++        g_SysWork.playerWork.player.health = hp;
++        ApplyWorld(&world);
++        LoadMenuResources(g_SavegamePtr->mapIdx);
++        SyncCombatFromSave();
++        Game_StateSetNext_ClearStateSteps(GameState_LoadStatusScreen);
++        SH_DBG("[RGDS_NATIVE] opening original menu for map %d without loading a second world", s_loadedMap);
++    }
++    if (!s_opened && g_GameWork.gameState == GameState_MainMenu) {
++        /* Wait at the title until the authoritative world has a valid save. Idling
++         * there starts the intro movie or an attract demo, which would load a whole
++         * second world on this 1 GB device; pin the idle counter like the title
++         * does under the achievements panel. */
++        g_PcConfig.skipIntros = 1;
++        g_PcConfig.attractDemos = 0;
++        g_SysWork.counters_1C[1] = 0;
++    }
++    if (!s_opened && g_GameWork.gameState == GameState_InGame && g_SysWork.sysState == SysState_Gameplay) {
++        g_Controller0->clickedBtnFlags |= ControllerFlag_Select;
++        g_Controller0->heldBtnFlags |= ControllerFlag_Select;
++    }
++    if (g_GameWork.gameState == GameState_InventoryScreen) s_opened = 1;
++    atomic_store(&s_bridge->workerState, (unsigned)(g_GameWork.gameState & 0xFF) << 24 |
++                 (unsigned)(g_GameWork.gameStateSteps[1] & 0xFF) << 16 | (unsigned)(g_Inventory_SelectionId & 0xFF) << 8 |
++                 (g_SysWork.invItemSelectedIdx >= 0 && g_SysWork.invItemSelectedIdx < INV_ITEM_COUNT_MAX ?
++                  g_SavegamePtr->items[g_SysWork.invItemSelectedIdx].id_0 : 0xFF));
++    if (!s_opened) return;
++
++    if (s_pending) {
++        if (atomic_load_explicit(&s_bridge->acknowledged, memory_order_acquire) == s_pending)
++            FinishCommand(s_bridge->result);
++        else if (NowMs() - s_pendingSince > RGDS_REQUEST_EXPIRY_MS + 500)
++            FinishCommand(-1);
++    }
++
++    valid = ReadSnapshot(&save, &hp, &world, &parentState);
++    if (!valid || save.inventorySlotCount < 8) return;
++
++    if (!s_mapSeenValid) {
++        s_mapSeen = world.mapRequest;
++        s_mapSeenValid = 1;
++    }
++    if (world.mapRequest != s_mapSeen) {
++        /* The world's map button: the same as choosing Map here, so the original
++         * checks (no paper map, too dark) and the original map screen apply; on
++         * the open map it closes it, as the original map button does. A press that
++         * arrives mid-transition (the map still opening, a floor change, the
++         * inventory taking over) waits for the screen to take input instead of
++         * being lost, up to a second. */
++        int onMap = g_GameWork.gameState == GameState_PaperMapScreen && g_GameWork.gameStateSteps[0] == 2;
++        int inInventory = g_GameWork.gameState == GameState_InventoryScreen && g_GameWork.gameStateSteps[1] == 1 &&
++                          ScreenFade_IsNone() && !s_exitAsk && !s_pending;
++        if (!s_mapWaitSince)
++            s_mapWaitSince = NowMs() | 1;
++        if (onMap || inInventory || NowMs() - s_mapWaitSince > 1000) {
++            s_mapSeen = world.mapRequest;
++            s_mapWaitSince = 0;
++        }
++        if (s_mapWaitSince) {
++            /* Still waiting. */
++        } else if (onMap) {
++            g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
++        } else if (inInventory) {
++            if (!s_mapFromWorld) /* reopened before the last close restored it */
++                s_mapPrevSelection = g_Inventory_SelectionId;
++            g_Inventory_SelectionId = InventorySelectionId_Map;
++            g_Inventory_PrevSelectionId = InventorySelectionId_Map;
++            g_Inventory_SelectionBordersDraw = 8;
++            g_Inventory_CmdSelectedIdx = 0;
++            g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
++            s_mapFromWorld = 1;
++            s_mapShown = 0;
++            s_mapAskedAt = NowMs();
++        }
++    }
++    if (s_mapFromWorld) {
++        if (g_GameWork.gameState == GameState_PaperMapScreen) {
++            s_mapShown = 1;
++        } else if (g_GameWork.gameState == GameState_InventoryScreen && g_GameWork.gameStateSteps[1] == 1 &&
++                   (s_mapShown || NowMs() - s_mapAskedAt > 400)) {
++            /* Back in the inventory (or the original refused: no map, too dark):
++             * the inventory looks as it did before the button. */
++            g_Inventory_SelectionId = s_mapPrevSelection;
++            g_Inventory_PrevSelectionId = s_mapPrevSelection;
++            g_Inventory_SelectionBordersDraw = 8;
++            s_mapFromWorld = 0;
++            SH_DBG("[RGDS_NATIVE_MAP] %s", s_mapShown ? "map closed" : "map refused");
++        }
++    }
++
++    if (g_GameWork.gameState == GameState_PaperMapScreen) {
++        /* The original map has no pointer support. Touch buttons, each the
++         * original's own input: the floor arrows (up/down), the close button
++         * (cancel) and the zoom button (enter). A tap elsewhere does nothing. */
++        float vx, vy;
++        ApplyWorld(&world);
++        if (g_GameWork.gameStateSteps[0] == 2 && Pc_MouseCursor_LeftClicked() && Pc_MouseCursor_ViewportPos(&vx, &vy)) {
++            float x = vx * 320.0f - 160.0f, y = vy * 448.0f - 224.0f;
++            if (vy >= RGDS_MAP_HIT_Y0 && vx <= RGDS_MAP_HIT_W)
++                g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
++            else if (vy >= RGDS_MAP_HIT_Y0 && vx >= 1.0f - RGDS_MAP_HIT_W)
++                g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.enter;
++            else if (x >= -RGDS_MAP_ARROW_HALF - 22 && x <= RGDS_MAP_ARROW_HALF + 22 && y <= -RGDS_MAP_ARROW_BASE + 11)
++                g_Controller0->clickedBtnFlags |= ControllerFlag_LStickUp;
++            else if (x >= -RGDS_MAP_ARROW_HALF - 22 && x <= RGDS_MAP_ARROW_HALF + 22 && y >= RGDS_MAP_ARROW_BASE - 11)
++                g_Controller0->clickedBtnFlags |= ControllerFlag_LStickDown;
++        }
++        return;
++    }
++    if (g_GameWork.gameState == GameState_InventoryScreen && g_GameWork.gameStateSteps[1] == 14) {
++        /* The original item view (Look) closes on action or cancel only. */
++        if (Pc_MouseCursor_LeftClicked())
++            g_Controller0->clickedBtnFlags |= g_GameWorkPtr->config.controllerConfig.cancel;
++        return;
++    }
++    if (g_GameWork.gameState != GameState_InventoryScreen || g_GameWork.gameStateSteps[1] != 1 || s_exitAsk)
++        return;
++
++    ApplyWorld(&world);
++    if (save.mapIdx != s_loadedMap) {
++        /* The world moved to another map: reload this map's item models and
++         * re-enter through the original status-screen loader. */
++        func_8004C040();
++        *g_SavegamePtr = save;
++        g_SysWork.playerWork.player.health = hp;
++        LoadMenuResources(save.mapIdx);
++        SyncCombatFromSave();
++        Game_StateSetNext_ClearStateSteps(GameState_LoadStatusScreen);
++        SH_DBG("[RGDS_NATIVE] world changed map; menu resources reloaded for map %d", s_loadedMap);
++        return;
++    }
++    {
++        int changed = g_SavegamePtr->equippedWeapon != save.equippedWeapon;
++        int i;
++        for (i = 0; i < INV_ITEM_COUNT_MAX; i++)
++            if (g_SavegamePtr->items[i].id_0 != save.items[i].id_0) changed = 1;
++        *g_SavegamePtr = save;
++        g_SysWork.playerWork.player.health = hp;
++        SyncCombatFromSave();
++        func_8004EF48();
++        if (changed) { func_8004C040(); Gfx_Items_Draw(); SH_DBG("[RGDS_NATIVE] refreshed original item models from live inventory"); }
++    }
++}
++
++void RgDs_NativeUpdate(void)
++{
++    s_frames++;
++    s_realHeld = g_Controller0->heldBtnFlags;
++    s_realHeldValid = 1;
++    if (s_worker) WorkerUpdate(); else ParentUpdate();
++}
++
++static void ForwardSfx(u16 id, s32 balance, u8 vol)
++{
++    unsigned write = atomic_load(&s_bridge->sfxWrite);
++    if (write - atomic_load_explicit(&s_bridge->sfxRead, memory_order_acquire) >= RGDS_SFX_RING) return;
++    s_bridge->sfx[write % RGDS_SFX_RING] = id | (unsigned)(u8)(s8)balance << 16 | (unsigned)vol << 24;
++    atomic_store_explicit(&s_bridge->sfxWrite, write + 1, memory_order_release);
++}
++
++int RgDs_NativeForwardSfx(unsigned short id, int balance, unsigned char vol)
++{
++    /* The bottom process has no audio device; its menu sounds play through the game. */
++    if (!s_bridge || !s_worker) return 0;
++    if (s_opened) ForwardSfx(id, balance, vol);
++    return 1;
++}
++
++int RgDs_NativeTakeTap(int* x, int* y)
++{
++    if (!s_bridge || !s_worker || !atomic_exchange(&s_tapPending, 0)) return 0;
++    *x = atomic_load(&s_tapX);
++    *y = atomic_load(&s_tapY);
++    return 1;
++}
++
++const char* RgDs_NativeStatusText(void)
++{
++    if (s_bridge && s_bridge->sysState == SysState_GamePaused) return "The_game_is_paused.";
++    return "Can't_use_it_now.";
++}
++
++static int Submit(int op, int item)
++{
++    unsigned request = atomic_load(&s_bridge->request);
++    if (s_pending || request != atomic_load_explicit(&s_bridge->acknowledged, memory_order_acquire)) return 0;
++    s_bridge->item = item;
++    s_bridge->operation = op;
++    s_bridge->requestTime = NowMs();
++    s_pending = request + 1;
++    s_pendingOp = op;
++    s_pendingSince = s_bridge->requestTime;
++    atomic_store_explicit(&s_bridge->request, request + 1, memory_order_release);
++    SH_DBG("[RGDS_NATIVE_REQUEST] request=%u item=%d op=%d", request + 1, item, op);
++    return 1;
++}
++
++/* Exit question layout, in the inventory's prim units (x: 3.2 px, y: 1.6 px at
++ * 1024x768; origin at the screen centre). Buttons are the bottom row's bars,
++ * larger; the hit boxes are a little larger still. */
++#define ASK_PANEL_W   136
++#define ASK_PANEL_H   96
++#define ASK_BTN_X0    12
++#define ASK_BTN_X1    120
++#define ASK_BTN_Y0    22
++#define ASK_BTN_Y1    78
++
++static int AskButtonAt(s32 x, s32 y)
++{
++    if (y < ASK_BTN_Y0 - 8 || y > ASK_BTN_Y1 + 8) return 0;
++    if (x >= -ASK_BTN_X1 - 8 && x <= -ASK_BTN_X0 + 4) return 1;  /* Yes */
++    if (x >= ASK_BTN_X0 - 4 && x <= ASK_BTN_X1 + 8) return 2;    /* No */
++    return 0;
++}
++
++static void AskOpen(void)
++{
++    s_exitAsk = 1;
++    s_exitYes = 0; /* No is the safe default, as in the original's prompts */
++    s_exitAskSince = NowMs();
++    SH_DBG("[RGDS_NATIVE] Exit pressed; asking for confirmation on the bottom screen");
++}
++
++static int DialogInput(void)
++{
++    unsigned clicked = g_Controller0->clickedBtnFlags, pulsed = g_Controller0->pulsedBtnFlags;
++    int answer = 0, mx, my;
++
++    if (NowMs() - s_exitAskSince > 200) {
++        if (pulsed & (ControllerFlag_DpadLeft | ControllerFlag_LStickLeft | ControllerFlag_DpadRight | ControllerFlag_LStickRight)) {
++            s_exitYes ^= 1;
++            ForwardSfx(Sfx_MenuMove, 64, 64);
++        }
++        if (Pc_MouseCursor_LeftClicked() && Pc_MouseCursor_UiPos(&mx, &my)) {
++            int button = AskButtonAt(mx - 160, my - 112);
++            if (button) { s_exitYes = button == 1; answer = button; }
++        }
++        if (!answer && (clicked & g_GameWorkPtr->config.controllerConfig.enter)) answer = s_exitYes ? 1 : 2;
++        else if (!answer && (clicked & g_GameWorkPtr->config.controllerConfig.cancel)) answer = 2;
++    }
++    ClearPad();
++    if (answer == 1) {
++        ForwardSfx(Sfx_MenuConfirm, 64, 64);
++        SH_DBG("[RGDS_NATIVE] Exit confirmed on the bottom screen");
++        s_exitAsk = 0;
++        atomic_store(&s_bridge->quit, 1);
++    } else if (answer == 2) {
++        ForwardSfx(Sfx_MenuCancel, 64, 64);
++        SH_DBG("[RGDS_NATIVE] Exit cancelled; game and menu keep running");
++        s_exitAsk = 0;
++    }
++    return 1;
++}
++
++int RgDs_NativeExitAsking(void)
++{
++    return s_bridge && s_worker && s_exitAsk;
++}
++
++static void AskBar(s32 bucket, s32 x0, s32 x1, s32 y0, s32 h, u8 r, u8 g, u8 b)
++{
++    GsOT* ot = &g_OrderingTable2[g_ActiveBufferIdx];
++    s32   k;
++    for (k = 0; k < 2; k++) {
++        POLY_G4* poly = (POLY_G4*)GsOUT_PACKET_P;
++        s32      top  = y0 + (k * h) / 2, bottom = y0 + ((k + 1) * h) / 2;
++        setPolyG4(poly);
++        if (k == 0) {
++            setRGB0(poly, 0, 0, 0); setRGB2(poly, 0, 0, 0);
++            setRGB1(poly, r, g, b); setRGB3(poly, r, g, b);
++        } else {
++            setRGB0(poly, r, g, b); setRGB2(poly, r, g, b);
++            setRGB1(poly, 0, 0, 0); setRGB3(poly, 0, 0, 0);
++        }
++        setXY4(poly, x0, top, x0, bottom, x1, top, x1, bottom);
++        addPrim(&ot->org[bucket], poly);
++        GsOUT_PACKET_P = (PACKET*)poly + sizeof(POLY_G4);
++    }
++}
++
++static void AskLine(s32 x0, s32 y0, s32 x1, s32 y1, u8 r0, u8 g0, u8 b0, u8 r1, u8 g1, u8 b1)
++{
++    GsOT*    ot   = &g_OrderingTable2[g_ActiveBufferIdx];
++    LINE_G2* line = (LINE_G2*)GsOUT_PACKET_P;
++    setLineG2(line);
++    setRGB0(line, r0, g0, b0);
++    setRGB1(line, r1, g1, b1);
++    setXY2(line, x0, y0, x1, y1);
++    addPrim(&ot->org[2], line);
++    GsOUT_PACKET_P = (PACKET*)line + sizeof(LINE_G2);
++}
++
++static void AskBox(s32 x0, s32 y0, s32 x1, s32 y1, u8 r, u8 g, u8 b)
++{
++    AskLine(x0, y0, x1, y0, r, g, b, r, g, b);
++    AskLine(x1, y0, x1, y1, r, g, b, r, g, b);
++    AskLine(x1, y1, x0, y1, r, g, b, r, g, b);
++    AskLine(x0, y1, x0, y0, r, g, b, r, g, b);
++}
++
++/* The game's font, scaled about its top-left corner and centred on (cx, cy). */
++static void AskText(const char* str, s32 cx, s32 cy, s32 scale)
++{
++    s32 w = (Pc_LangMenuTextWidth(Pc_LangMenuText(str)) * scale) >> 12;
++    s32 h = (15 * scale) >> 12;
++    Gfx_StringSetPosition(cx - (w / 2) + 160, cy - (h / 2) + 112);
++    Gfx_Strings2dLayerIdxSet(1);
++    Gfx_StringSetColor(StringColorId_White);
++    Gfx_RgdsStringScaleSet(scale);
++    Gfx_StringDraw((char*)str, 64);
++    Gfx_RgdsStringScaleSet(Q12(1.0f));
++    Gfx_StringsReset2dLayerIdx();
++}
++
++/* The map screen only notes its buttons here; rgds_map_icons.c draws them after
++ * the frame, over the finished picture. Hidden while the screen fades, as are
++ * the original floor arrows. */
++static unsigned s_mapIconsFrame;
++static int      s_mapIconsZoomed;
++
++void RgDs_NativeMapOverlayDraw(int zoomed)
++{
++    if (!s_bridge || !s_worker || !ScreenFade_IsNone())
++        return;
++    s_mapIconsFrame  = s_frames;
++    s_mapIconsZoomed = zoomed;
++}
++
++int RgDs_NativeMapIcons(void)
++{
++    if (!s_bridge || !s_worker || s_mapIconsFrame != s_frames || g_GameWork.gameState != GameState_PaperMapScreen)
++        return 0;
++    return s_mapIconsZoomed ? 2 : 1;
++}
++
++void RgDs_NativeOverlayDraw(void)
++{
++    GsOT*    ot;
++    POLY_F4* poly;
++    s32      i, pulse, x0, x1;
++
++    if (!RgDs_NativeExitAsking())
++        return;
++    ot    = &g_OrderingTable2[g_ActiveBufferIdx];
++    pulse = (NowMs() / 16) & 0x7F;
++    pulse = pulse < 0x40 ? pulse : 0x7F - pulse;
++
++    /* Everything behind dims to half (abr 0 with black), the panel itself is solid. */
++    poly = (POLY_F4*)GsOUT_PACKET_P;
++    setPolyF4(poly);
++    setSemiTrans(poly, 1);
++    setRGB0(poly, 0, 0, 0);
++    setXY4(poly, -160, -240, -160, 240, 160, -240, 160, 240);
++    addPrim(&ot->org[4], poly);
++    GsOUT_PACKET_P = (PACKET*)poly + sizeof(POLY_F4);
++    Gfx_Primitive2dTextureSet(0, 0, 4, 0);
++
++    poly = (POLY_F4*)GsOUT_PACKET_P;
++    setPolyF4(poly);
++    setRGB0(poly, 0, 0, 0);
++    setXY4(poly, -ASK_PANEL_W, -ASK_PANEL_H, -ASK_PANEL_W, ASK_PANEL_H, ASK_PANEL_W, -ASK_PANEL_H, ASK_PANEL_W, ASK_PANEL_H);
++    addPrim(&ot->org[3], poly);
++    GsOUT_PACKET_P = (PACKET*)poly + sizeof(POLY_F4);
++
++    AskBox(-ASK_PANEL_W, -ASK_PANEL_H, ASK_PANEL_W, ASK_PANEL_H, 0x60, 0x60, 0xFF);
++    AskBox(-ASK_PANEL_W + 3, -ASK_PANEL_H + 4, ASK_PANEL_W - 3, ASK_PANEL_H - 4, 0x20, 0x20, 0x80);
++
++    /* Title on a header bar, then the warning, as the inventory's labels. */
++    AskBar(2, -ASK_PANEL_W + 8, ASK_PANEL_W - 8, -86, 24, 0x00, 0x80, 0xC0);
++    AskText("Quit_to_Ports?", 0, -74, Q12(1.4f));
++    AskText("Unsaved_progress", 0, -34, Q12(1.2f));
++    AskText("will_be_lost.", 0, -12, Q12(1.2f));
++
++    /* Yes / No: the bottom row's bars, larger; the selected one pulses and gets
++     * the selection bracket, as Option / Exit / Map do. */
++    for (i = 0; i < 2; i++) {
++        int selected = (i == 0) == (s_exitYes != 0);
++        x0 = i == 0 ? -ASK_BTN_X1 : ASK_BTN_X0;
++        x1 = i == 0 ? -ASK_BTN_X0 : ASK_BTN_X1;
++        if (selected) AskBar(2, x0, x1, ASK_BTN_Y0, ASK_BTN_Y1 - ASK_BTN_Y0, pulse * 3, (u8)(pulse - 0x80), 0xC0);
++        else          AskBar(2, x0, x1, ASK_BTN_Y0, ASK_BTN_Y1 - ASK_BTN_Y0, 0x00, 0x80, 0xC0);
++        AskText(i == 0 ? "Yes" : "No", (x0 + x1) / 2, (ASK_BTN_Y0 + ASK_BTN_Y1) / 2, Q12(1.8f));
++        if (selected) {
++            u8 a = (u8)(0xB0 - pulse), c = (u8)(0x70 + pulse);
++            AskBox(x0 - 2, ASK_BTN_Y0 - 3, x1 + 2, ASK_BTN_Y1 + 3, 0x60, 0x60, 0xFF);
++            AskLine(x0 - 5, ASK_BTN_Y0 - 7, x0 + 30, ASK_BTN_Y0 - 7, a, a, 0xFF, c, c, 0xFF);
++            AskLine(x0 - 5, ASK_BTN_Y0 - 7, x0 - 5, ASK_BTN_Y0 + 18, a, a, 0xFF, c, c, 0xFF);
++            AskLine(x1 + 5, ASK_BTN_Y1 + 7, x1 - 30, ASK_BTN_Y1 + 7, a, a, 0xFF, c, c, 0xFF);
++            AskLine(x1 + 5, ASK_BTN_Y1 + 7, x1 + 5, ASK_BTN_Y1 - 18, a, a, 0xFF, c, c, 0xFF);
++        }
++    }
++}
++
++int RgDs_NativeMenuInput(void)
++{
++    unsigned enter, cancel;
++    if (!s_bridge || !s_worker) return 0;
++    if (s_exitAsk) return DialogInput();
++    enter = g_GameWorkPtr->config.controllerConfig.enter;
++    cancel = g_GameWorkPtr->config.controllerConfig.cancel;
++    /* The original item/start exits would leave for a world this process never loads. */
++    StripPad(ControllerFlag_Select | ControllerFlag_Start | g_GameWorkPtr->config.controllerConfig.item);
++    if (s_pending) {
++        StripPad(enter | cancel);
++        return 0;
++    }
++    if (g_GameWork.gameStateSteps[1] != 1) return 0;
++    if (g_Inventory_SelectionId == InventorySelectionId_Exit && (g_Controller0->clickedBtnFlags & enter)) {
++        StripPad(enter);
++        ForwardSfx(Sfx_MenuConfirm, 64, 64);
++        AskOpen();
++        return 0;
++    }
++    if (g_Inventory_SelectionId == InventorySelectionId_Settings && (g_Controller0->clickedBtnFlags & enter)) {
++        StripPad(enter);
++        Submit(RgDsOp_Options, 0);
++        return 0;
++    }
++    if (g_Inventory_SelectionId != InventorySelectionId_ItemCmd &&
++        g_Inventory_SelectionId != InventorySelectionId_EquippedItemCmd &&
++        g_Inventory_SelectionId != InventorySelectionId_Examine &&
++        (g_Controller0->clickedBtnFlags & cancel)) {
++        if (atomic_exchange(&s_bridge->focus, 0))
++            SH_DBG("[RGDS_NATIVE_FOCUS] cancel in the menu: pad returns to the world");
++        StripPad(cancel);
++    }
++    return 0;
++}
++
++int RgDs_NativeCommand(int slot, int command, int row)
++{
++    int op;
++    if (!s_bridge || !s_worker) return 0;
++    switch (command)
++    {
++        case InvCmdId_UseHealth:
++        case InvCmdId_Use:           op = RgDsOp_Use; break;
++        case InvCmdId_UseLook:       if (row) return 0; op = RgDsOp_Use; break;
++        case InvCmdId_Equip:         op = RgDsOp_Equip; break;
++        case InvCmdId_Unequip:       op = RgDsOp_Unequip; break;
++        case InvCmdId_Reload:        op = RgDsOp_Reload; break;
++        case InvCmdId_EquipReload:   op = row ? RgDsOp_Reload : RgDsOp_Equip; break;
++        case InvCmdId_UnequipReload: op = row ? RgDsOp_Reload : RgDsOp_Unequip; break;
++        case InvCmdId_OnOff:         op = row ? RgDsOp_Off : RgDsOp_On; break;
++        default:                     return 0;
++    }
++    if (!Submit(op, g_SavegamePtr->items[slot].id_0)) return 1;
++    /* Hold the command row until the world answers; FinishCommand gives the feedback. */
++    g_Inventory_SelectionBordersDraw = 8;
++    return 1;
++}
++
++void RgDs_NativePresent(void)
++{
++    unsigned now = SDL_GetTicks();
++    if (s_worker) {
++        unsigned last = atomic_load(&s_lastInput);
++        int active = atomic_load(&s_bridge->focus) || s_pending || s_exitAsk ||
++                     (last && NowMs() - last < 5000) ||
++                     g_GameWork.gameState != GameState_InventoryScreen || g_GameWork.gameStateSteps[1] != 1 ||
++                     g_Inventory_SelectionBordersDraw < 8;
++        int fps = active ? s_menuFps : s_idleFps;
++        Uint64 frequency = SDL_GetPerformanceFrequency();
++        Uint64 frame = frequency / (Uint64)fps;
++        Uint64 current = SDL_GetPerformanceCounter();
++        if (fps < 60 && s_lastPresent && current - s_lastPresent < frame)
++            SDL_Delay((Uint32)((frame - (current - s_lastPresent)) * 1000 / frequency));
++        s_lastPresent = SDL_GetPerformanceCounter();
++    }
++    if (now - s_lastTrace >= 3000) {
++        SH_DBG("[RGDS_NATIVE_LIVE] role=%s frame=%u state=%d sys=%d focus=%u time=%d hp=%d weapon=%d request=%u ack=%u",
++               s_worker ? "inventory" : "game", s_frames, g_GameWork.gameState, g_SysWork.sysState,
++               atomic_load(&s_bridge->focus), g_SavegamePtr->gameplayTimer,
++               g_SysWork.playerWork.player.health, g_SavegamePtr->equippedWeapon,
++               atomic_load(&s_bridge->request), atomic_load(&s_bridge->acknowledged));
++        s_lastTrace = now;
++    }
++}
++#else
++int RgDs_NativeInit(void) { return 0; }
++int RgDs_NativeActive(void) { return 0; }
++int RgDs_NativeIsMenuProcess(void) { return 0; }
++int RgDs_NativeMenuReady(void) { return 0; }
++int RgDs_NativeInputFocus(void) { return 0; }
++void RgDs_NativeUpdate(void) { }
++void RgDs_NativePresent(void) { }
++int RgDs_NativeCommand(int slot, int command, int row) { (void)slot; (void)command; (void)row; return 0; }
++int RgDs_NativeMenuInput(void) { return 0; }
++int RgDs_NativeExitAsking(void) { return 0; }
++void RgDs_NativeOverlayDraw(void) { }
++void RgDs_NativeMapOverlayDraw(int zoomed) { (void)zoomed; }
++int RgDs_NativeMapIcons(void) { return 0; }
++void RgDs_NativeRestoreHeld(void) { }
++int RgDs_NativeForwardSfx(unsigned short id, int balance, unsigned char vol) { (void)id; (void)balance; (void)vol; return 0; }
++int RgDs_NativeTakeTap(int* x, int* y) { (void)x; (void)y; return 0; }
++const char* RgDs_NativeStatusText(void) { return ""; }
++#endif
+diff --git a/pc_port/src/rgds_wayland.c b/pc_port/src/rgds_wayland.c
+new file mode 100644
+index 0000000..39b09a1
+--- /dev/null
++++ b/pc_port/src/rgds_wayland.c
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "rgds_wayland.h"
++#ifdef SH_RGDS
++#include <SDL2/SDL_syswm.h>
++#include <wayland-client.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <string.h>
++#include "sh_log.h"
++
++enum { WIDTH = 1024, HEIGHT = 768, STRIDE = WIDTH * 4, BUFFER_SIZE = STRIDE * HEIGHT, BUFFER_COUNT = 3 };
++static struct wl_display* s_display;
++static struct wl_surface* s_wlSurface;
++static struct wl_shm* s_shm;
++static struct {
++    struct wl_buffer* buffer;
++    SDL_Surface* surface;
++    int busy;
++} s_buffers[BUFFER_COUNT];
++static int s_current = -1;
++
++static void RegistryGlobal(void* data, struct wl_registry* registry, uint32_t name, const char* interface, uint32_t version)
++{
++    (void)data; (void)version;
++    if (!strcmp(interface, "wl_shm"))
++        s_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
++}
++
++static void RegistryRemove(void* data, struct wl_registry* registry, uint32_t name)
++{
++    (void)data; (void)registry; (void)name;
++}
++
++static void BufferRelease(void* data, struct wl_buffer* buffer)
++{
++    (void)buffer;
++    *(int*)data = 0;
++}
++
++int RgDs_WaylandInit(SDL_Window* window)
++{
++    SDL_SysWMinfo info;
++    struct wl_registry* registry;
++    struct wl_shm_pool* pool;
++    static const struct wl_registry_listener registryListener = { RegistryGlobal, RegistryRemove };
++    static const struct wl_buffer_listener bufferListener = { BufferRelease };
++    char path[] = "/tmp/silent-hill-rgds-shm-XXXXXX";
++    void* pixels;
++    int fd, i;
++    SDL_VERSION(&info.version);
++    if (!SDL_GetWindowWMInfo(window, &info) || info.subsystem != SDL_SYSWM_WAYLAND) return 0;
++    s_display = info.info.wl.display;
++    s_wlSurface = info.info.wl.surface;
++    registry = wl_display_get_registry(s_display);
++    wl_registry_add_listener(registry, &registryListener, NULL);
++    wl_display_roundtrip(s_display);
++    wl_registry_destroy(registry);
++    if (!s_shm) return 0;
++    fd = mkstemp(path);
++    if (fd < 0) return 0;
++    unlink(path);
++    if (ftruncate(fd, BUFFER_SIZE * BUFFER_COUNT) < 0) { close(fd); return 0; }
++    pixels = mmap(NULL, BUFFER_SIZE * BUFFER_COUNT, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (pixels == MAP_FAILED) { close(fd); return 0; }
++    pool = wl_shm_create_pool(s_shm, fd, BUFFER_SIZE * BUFFER_COUNT);
++    for (i = 0; i < BUFFER_COUNT; i++) {
++        s_buffers[i].buffer = wl_shm_pool_create_buffer(pool, i * BUFFER_SIZE, WIDTH, HEIGHT, STRIDE, WL_SHM_FORMAT_XRGB8888);
++        wl_buffer_add_listener(s_buffers[i].buffer, &bufferListener, &s_buffers[i].busy);
++        s_buffers[i].surface = SDL_CreateRGBSurfaceWithFormatFrom((char*)pixels + i * BUFFER_SIZE, WIDTH, HEIGHT, 32, STRIDE, SDL_PIXELFORMAT_ARGB8888);
++    }
++    wl_shm_pool_destroy(pool);
++    close(fd);
++    SH_DBG("[RGDS_SHM] initialized %dx%d, %d buffers; lower window uses no GL context", WIDTH, HEIGHT, BUFFER_COUNT);
++    return 1;
++}
++
++SDL_Surface* RgDs_WaylandBegin(void)
++{
++    int i;
++    wl_display_dispatch_pending(s_display);
++    for (i = 0; i < BUFFER_COUNT; i++) {
++        if (!s_buffers[i].busy) {
++            s_current = i;
++            return s_buffers[i].surface;
++        }
++    }
++    return NULL;
++}
++
++int RgDs_WaylandCommit(void)
++{
++    if (s_current < 0) return -1;
++    s_buffers[s_current].busy = 1;
++    wl_surface_attach(s_wlSurface, s_buffers[s_current].buffer, 0, 0);
++    wl_surface_damage(s_wlSurface, 0, 0, WIDTH, HEIGHT);
++    wl_surface_commit(s_wlSurface);
++    wl_display_flush(s_display);
++    s_current = -1;
++    return 0;
++}
++#else
++int RgDs_WaylandInit(SDL_Window* window) { (void)window; return 0; }
++SDL_Surface* RgDs_WaylandBegin(void) { return NULL; }
++int RgDs_WaylandCommit(void) { return -1; }
++#endif
+diff --git a/pc_port/src/rgds_map_icons.c b/pc_port/src/rgds_map_icons.c
+new file mode 100644
+index 0000000..0be3540
+--- /dev/null
++++ b/pc_port/src/rgds_map_icons.c
+@@ -0,0 +1,248 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* RG DS Plus bottom screen: the paper map's touch buttons (close, zoom).
++ *
++ * PSX prims sit on a 320x448 grid that is 3.2 px wide and 1.7 px tall per unit
++ * on the 1024x768 panel, so squares came out as rectangles and thin strokes
++ * changed thickness with their slope. The buttons are drawn here instead, in
++ * window pixels from the post-capture hook (like the Exit dialog), as
++ * anti-aliased sprites rasterised once at start-up in the menu's colours. */
++#include "rgds_native.h"
++#if defined(SH_RGDS) && defined(__linux__)
++#include <math.h>
++#include <PsyX/common/glad.h>
++#include <PsyX/PsyX_backend.h>
++#include "sh_log.h"
++
++#define ICON_PX 64
++
++enum { ICON_CLOSE, ICON_ZOOM_IN, ICON_ZOOM_OUT, ICON_COUNT };
++
++static GLuint s_prog, s_vao, s_vbo, s_tex[ICON_COUNT];
++static GLint  s_locAlpha;
++static int    s_ready;
++
++static float Clamp01(float v)
++{
++    return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
++}
++
++/* Distance from p to the segment a-b, in pixels. */
++static float Segment(float px, float py, float ax, float ay, float bx, float by)
++{
++    float dx = bx - ax, dy = by - ay, t;
++    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
++    t = Clamp01(t);
++    dx = px - (ax + t * dx);
++    dy = py - (ay + t * dy);
++    return sqrtf(dx * dx + dy * dy);
++}
++
++/* Coverage of a stroke of half-width r at distance d, with a one-pixel edge. */
++static float Ink(float d, float r)
++{
++    return Clamp01(r - d + 0.5f);
++}
++
++static void Rasterise(int icon, unsigned char* rgba)
++{
++    int x, y;
++    for (y = 0; y < ICON_PX; y++) {
++        for (x = 0; x < ICON_PX; x++) {
++            float px = x + 0.5f, py = y + 0.5f, glyph = 0.0f, band;
++            float r, g, b, a = 0.92f;
++            unsigned char* out = rgba + (y * ICON_PX + x) * 4;
++            int edge = x < 2 || y < 2 || x >= ICON_PX - 2 || y >= ICON_PX - 2;
++            int inner = x >= 4 && y >= 4 && x < ICON_PX - 4 && y < ICON_PX - 4;
++
++            /* Panel as in the Exit dialog and the inventory bars: black, a blue
++             * outline, and the black-blue-black band of the menu bars. */
++            band = 1.0f - fabsf((py - ICON_PX * 0.5f) / (ICON_PX * 0.5f - 4.0f));
++            r = 0.0f;
++            g = inner ? (float)0x80 / 255.0f * Clamp01(band) : 0.0f;
++            b = inner ? (float)0xC0 / 255.0f * Clamp01(band) : 0.0f;
++            if (edge) { r = g = 0x60 / 255.0f; b = 1.0f; }
++
++            if (icon == ICON_CLOSE) {
++                glyph = Ink(Segment(px, py, 20, 20, 44, 44), 2.6f);
++                glyph = fmaxf(glyph, Ink(Segment(px, py, 20, 44, 44, 20), 2.6f));
++            } else {
++                float dx = px - 27.0f, dy = py - 27.0f;
++                glyph = Ink(fabsf(sqrtf(dx * dx + dy * dy) - 11.0f), 1.7f);
++                glyph = fmaxf(glyph, Ink(Segment(px, py, 35.5f, 35.5f, 46, 46), 3.2f));
++                glyph = fmaxf(glyph, Ink(Segment(px, py, 21.5f, 27, 32.5f, 27), 1.4f));
++                if (icon == ICON_ZOOM_IN)
++                    glyph = fmaxf(glyph, Ink(Segment(px, py, 27, 21.5f, 27, 32.5f), 1.4f));
++            }
++            r += (0xE0 / 255.0f - r) * glyph;
++            g += (0xE0 / 255.0f - g) * glyph;
++            b += (1.0f - b) * glyph;
++            out[0] = (unsigned char)(r * 255.0f + 0.5f);
++            out[1] = (unsigned char)(g * 255.0f + 0.5f);
++            out[2] = (unsigned char)(b * 255.0f + 0.5f);
++            out[3] = (unsigned char)(a * 255.0f + 0.5f);
++        }
++    }
++}
++
++static GLuint Shader(GLenum type, const char* src)
++{
++    const char* parts[2] = { PsyX_Shader_Preamble(type == GL_FRAGMENT_SHADER, PSYX_GLSL_LEGACY), src };
++    GLuint sh = glCreateShader(type);
++    GLint ok = 0;
++    glShaderSource(sh, 2, parts, NULL);
++    glCompileShader(sh);
++    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[256];
++        glGetShaderInfoLog(sh, (GLsizei)sizeof(log), NULL, log);
++        SH_DBG("[RGDS_MAP_ICONS] shader failed: %s", log);
++        glDeleteShader(sh);
++        return 0;
++    }
++    return sh;
++}
++
++static void Init(void)
++{
++    static const char* vs_src =
++        "attribute vec2 a_pos;\n"
++        "attribute vec2 a_uv;\n"
++        "varying vec2 v_uv;\n"
++        "void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
++    static const char* fs_src =
++        "#ifdef GL_ES\n"
++        "precision mediump float;\n"
++        "#endif\n"
++        "varying vec2 v_uv;\n"
++        "uniform sampler2D u_tex;\n"
++        "uniform float u_alpha;\n"
++        "void main() { vec4 c = texture2D(u_tex, v_uv); gl_FragColor = vec4(c.rgb, c.a * u_alpha); }\n";
++    static unsigned char rgba[ICON_PX * ICON_PX * 4];
++    GLuint vs, fs;
++    GLint ok = 0, prevProg = 0, prevVao = 0, prevBuf = 0, prevTex = 0;
++    int i;
++
++    s_ready = -1;
++    vs = Shader(GL_VERTEX_SHADER, vs_src);
++    fs = Shader(GL_FRAGMENT_SHADER, fs_src);
++    if (!vs || !fs)
++        return;
++    s_prog = glCreateProgram();
++    glAttachShader(s_prog, vs);
++    glAttachShader(s_prog, fs);
++    glBindAttribLocation(s_prog, 0, "a_pos");
++    glBindAttribLocation(s_prog, 1, "a_uv");
++    glLinkProgram(s_prog);
++    glGetProgramiv(s_prog, GL_LINK_STATUS, &ok);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    if (!ok) {
++        glDeleteProgram(s_prog);
++        s_prog = 0;
++        return;
++    }
++    /* PsyCross caches the bound program; put back whatever it had. */
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
++    glUseProgram(s_prog);
++    glUniform1i(glGetUniformLocation(s_prog, "u_tex"), 0);
++    s_locAlpha = glGetUniformLocation(s_prog, "u_alpha");
++    glUseProgram((GLuint)prevProg);
++
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
++    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
++    glGenVertexArrays(1, &s_vao);
++    glBindVertexArray(s_vao);
++    glGenBuffers(1, &s_vbo);
++    glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
++    glBufferData(GL_ARRAY_BUFFER, 6 * 4 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
++    glEnableVertexAttribArray(0);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
++    glEnableVertexAttribArray(1);
++    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
++    glBindVertexArray((GLuint)prevVao);
++    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
++
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    for (i = 0; i < ICON_COUNT; i++) {
++        Rasterise(i, rgba);
++        glGenTextures(1, &s_tex[i]);
++        glBindTexture(GL_TEXTURE_2D, s_tex[i]);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ICON_PX, ICON_PX, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++    }
++    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
++    s_ready = 1;
++}
++
++/* Rect in fractions of the presented picture (0..1, top-left origin). */
++static void Quad(GLuint tex, float x0, float y0, float x1, float y1)
++{
++    float v[6][4] = {
++        { x0 * 2 - 1, 1 - y0 * 2, 0, 0 }, { x0 * 2 - 1, 1 - y1 * 2, 0, 1 }, { x1 * 2 - 1, 1 - y0 * 2, 1, 0 },
++        { x1 * 2 - 1, 1 - y0 * 2, 1, 0 }, { x0 * 2 - 1, 1 - y1 * 2, 0, 1 }, { x1 * 2 - 1, 1 - y1 * 2, 1, 1 },
++    };
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(v), v);
++    glDrawArrays(GL_TRIANGLES, 0, 6);
++}
++
++void RgDs_MapIconsDraw(int zoomed)
++{
++    GLint prevProg = 0, prevVao = 0, prevBuf = 0, prevTex = 0, prevUnit = GL_TEXTURE0;
++    GLint prevSrcRgb = GL_ONE, prevDstRgb = GL_ZERO, prevSrcA = GL_ONE, prevDstA = GL_ZERO;
++    GLint prevEqRgb = GL_FUNC_ADD, prevEqA = GL_FUNC_ADD;
++    GLboolean prevBlend, prevDepth, prevCull, prevScissor;
++
++    if (!s_ready) Init();
++    if (s_ready != 1) return;
++
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
++    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevUnit);
++    glActiveTexture(GL_TEXTURE0);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
++    glGetIntegerv(GL_BLEND_SRC_RGB, &prevSrcRgb);
++    glGetIntegerv(GL_BLEND_DST_RGB, &prevDstRgb);
++    glGetIntegerv(GL_BLEND_SRC_ALPHA, &prevSrcA);
++    glGetIntegerv(GL_BLEND_DST_ALPHA, &prevDstA);
++    glGetIntegerv(GL_BLEND_EQUATION_RGB, &prevEqRgb);
++    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &prevEqA);
++    prevBlend = glIsEnabled(GL_BLEND);
++    prevDepth = glIsEnabled(GL_DEPTH_TEST);
++    prevCull = glIsEnabled(GL_CULL_FACE);
++    prevScissor = glIsEnabled(GL_SCISSOR_TEST);
++
++    glUseProgram(s_prog);
++    glBindVertexArray(s_vao);
++    glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
++    glEnable(GL_BLEND);
++    glBlendEquation(GL_FUNC_ADD);
++    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_CULL_FACE);
++    glDisable(GL_SCISSOR_TEST);
++    glUniform1f(s_locAlpha, 1.0f);
++    Quad(s_tex[ICON_CLOSE], RGDS_MAP_CLOSE_X0, RGDS_MAP_BTN_Y0, RGDS_MAP_CLOSE_X0 + RGDS_MAP_BTN_W, RGDS_MAP_BTN_Y0 + RGDS_MAP_BTN_H);
++    Quad(s_tex[zoomed ? ICON_ZOOM_OUT : ICON_ZOOM_IN], RGDS_MAP_ZOOM_X0, RGDS_MAP_BTN_Y0,
++         RGDS_MAP_ZOOM_X0 + RGDS_MAP_BTN_W, RGDS_MAP_BTN_Y0 + RGDS_MAP_BTN_H);
++
++    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
++    glActiveTexture((GLenum)prevUnit);
++    glBlendEquationSeparate((GLenum)prevEqRgb, (GLenum)prevEqA);
++    glBlendFuncSeparate((GLenum)prevSrcRgb, (GLenum)prevDstRgb, (GLenum)prevSrcA, (GLenum)prevDstA);
++    if (!prevBlend) glDisable(GL_BLEND);
++    if (prevDepth) glEnable(GL_DEPTH_TEST);
++    if (prevCull) glEnable(GL_CULL_FACE);
++    if (prevScissor) glEnable(GL_SCISSOR_TEST);
++    glUseProgram((GLuint)prevProg);
++    glBindVertexArray((GLuint)prevVao);
++    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevBuf);
++}
++#else
++void RgDs_MapIconsDraw(int zoomed) { (void)zoomed; }
++#endif

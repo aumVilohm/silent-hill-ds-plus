@@ -1,0 +1,23 @@
+# Game data and disc images: never in this repository.
+gamedata/
+disc_extract/
+**/build_gen/extracted_data/
+*.bin
+*.BIN
+*.cue
+*.CUE
+*.iso
+*.ISO
+*.chd
+*.pbp
+*.img
+*.mcd
+*.MCD
+
+# Upstream sources you fetch and build products.
+upstream/
+build/
+dist/
+*.tar.gz
+__pycache__/
+.DS_Store

@@ -1,0 +1,19 @@
+{
+  "upstream": "60ed02045da3dbd3d5633e9528f33707b0f03c95",
+  "psycross": "20a2fb4798be6c57ebe799dc03e07338b5551563",
+  "new_source_files": [
+    "pc_port/include/pc_host_pointer.h",
+    "pc_port/include/rgds_inventory.h",
+    "pc_port/include/rgds_native.h",
+    "pc_port/include/rgds_wayland.h",
+    "pc_port/src/rgds_inventory.c",
+    "pc_port/src/rgds_native.c",
+    "pc_port/src/rgds_wayland.c",
+    "pc_port/src/rgds_map_icons.c"
+  ],
+  "psycross_new_source_files": [
+    "src/render/rgds_uniform_cache.h"
+  ],
+  "local_binary_sha1": "f69fbb7831810d331b09d46684175f31298def56",
+  "note": "SHA-1 of SilentHillPC built by tools/build.sh. The build is reproducible (SOURCE_DATE_EPOCH = pinned upstream commit time)."
+}

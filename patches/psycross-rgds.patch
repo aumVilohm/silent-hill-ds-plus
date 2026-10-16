@@ -1,0 +1,1790 @@
+diff --git a/include/PsyX/PsyX_public.h b/include/PsyX/PsyX_public.h
+index d778e60..b121999 100644
+--- a/include/PsyX/PsyX_public.h
++++ b/include/PsyX/PsyX_public.h
+@@ -55,6 +55,7 @@ extern PsyXKeyboardMapping			g_cfg_keyboardMapping;
+ extern PsyXKeyboardMapping			g_cfg_keyboardMapping2;		/* PC: secondary keyboard binds (active w/ allow_mouse_secondary) */
+ extern int							g_cfg_controllerToSlotMapping[2];
+ extern int							g_cfg_controllerMovement;	/* PC: 0=analog 1=dpad 2=both */
++extern int							g_cfg_swapFaceButtons;		/* RG DS Plus: 1 = swap SDL A<->B and X<->Y for this game */
+ extern int							g_cfg_allowMouseSecondary;	/* PC: 1 = secondary + mouse-button binds active */
+ extern unsigned short				g_cfg_mouseButtonMask[8];	/* PC: [SDL button 1..5] -> PSX button bitmask */
+ 
+@@ -189,6 +190,9 @@ float PGXP_GetSzMax(void);    /* prev-frame max SZ for shader depth normalize */
+  * effectively uses (g_cfg_psxDither && !g_PsxDitherSuppressed). */
+ extern int							g_PsxDitherSuppressed;
+ 
++/* RG DS Plus: enable the A<->B / X<->Y swap and apply it to open controllers. */
++extern void PsyX_Pad_SetFaceSwap(int mask); /* RG DS Plus: 1 = A<->B, 2 = X<->Y */
++
+ /* Debug inputs */
+ extern GameDebugKeysHandlerFunc		g_dbg_gameDebugKeys;
+ extern GameDebugMouseHandlerFunc	g_dbg_gameDebugMouse;
+diff --git a/src/PsyX_main.cpp b/src/PsyX_main.cpp
+index 031c91d..0ab7356 100644
+--- a/src/PsyX_main.cpp
++++ b/src/PsyX_main.cpp
+@@ -27,6 +27,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <SDL.h>
++#ifdef __linux__
++#include <time.h>
++#endif
+ 
+ #include <exception>
+ 
+@@ -226,6 +229,14 @@ int intrThreadMain(void* data)
+ 	timerCtx_t rcnt2Timer;
+ 	Util_InitHPCTimer(&g_vblTimer);
+ 	Util_InitHPCTimer(&rcnt2Timer);
++#ifdef __linux__
++	const bool idleSleep = getenv("SH_RGDS") != NULL;
++	double vblEpoch = 0, rcnt2Epoch = 0;
++	bool rcnt2WasActive = false;
++	/* A wall-clock correction must not turn into a backlog of musical ticks. */
++	const Uint64 timerOrigin = SDL_GetPerformanceCounter();
++	const double counterSeconds = 1.0 / SDL_GetPerformanceFrequency();
++#endif
+ 
+ 	/* PSX RCnt2 = system clock / 8 = 4233600 Hz.
+ 	 * Target 7328 → fires at 4233600/7328 ≈ 577.8 Hz → ~1.73ms period */
+@@ -236,9 +247,17 @@ int intrThreadMain(void* data)
+ 		// step counters
+ 		{
+ 			const double timestep = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+-			const double vblDelta = Util_GetHPCTime(&g_vblTimer, 0);
++			const double vblDelta =
++#ifdef __linux__
++				idleSleep ? (SDL_GetPerformanceCounter() - timerOrigin) * counterSeconds :
++#endif
++				Util_GetHPCTime(&g_vblTimer, 0);
++			double vblTarget = timestep;
++#ifdef __linux__
++			if (idleSleep) vblTarget += vblEpoch;
++#endif
+ 
+-			if (vblDelta > timestep)
++			if (vblDelta > vblTarget)
+ 			{
+ 				SDL_LockMutex(g_intrMutex);
+ 
+@@ -250,21 +269,47 @@ int intrThreadMain(void* data)
+ 				// do vblank events
+ 				g_psxSysCounters[PsxCounter_VBLANK]++;
+ 
+-				Util_GetHPCTime(&g_vblTimer, 1);
++#ifdef __linux__
++				/* Sleeping can overshoot a deadline; retain its phase so clock
++				 * errors do not accumulate into slow gameplay or slow music. */
++				if (idleSleep) vblEpoch += timestep;
++				else
++#endif
++					Util_GetHPCTime(&g_vblTimer, 1);
+ 			}
+ 
+ 			/* Pump RCnt2 timer for BGM/MIDI sequencer */
+ 			if (g_rcnt2_timer_active)
+ 			{
+-				const double rcnt2Delta = Util_GetHPCTime(&rcnt2Timer, 0);
+-				if (rcnt2Delta > rcnt2Period)
++				const double rcnt2Delta =
++#ifdef __linux__
++					idleSleep ? (SDL_GetPerformanceCounter() - timerOrigin) * counterSeconds :
++#endif
++					Util_GetHPCTime(&rcnt2Timer, 0);
++				double rcnt2Target = rcnt2Period;
++#ifdef __linux__
++				if (idleSleep)
++				{
++					if (!rcnt2WasActive) rcnt2Epoch = rcnt2Delta - rcnt2Period;
++					rcnt2WasActive = true;
++					rcnt2Target += rcnt2Epoch;
++				}
++#endif
++				if (rcnt2Delta > rcnt2Target)
+ 				{
+ 					SDL_LockMutex(g_intrMutex);
+ 					PsyX_PumpRCnt2Timer();
+ 					SDL_UnlockMutex(g_intrMutex);
+-					Util_GetHPCTime(&rcnt2Timer, 1);
++#ifdef __linux__
++					if (idleSleep) rcnt2Epoch += rcnt2Period;
++					else
++#endif
++						Util_GetHPCTime(&rcnt2Timer, 1);
+ 				}
+ 			}
++#ifdef __linux__
++			else rcnt2WasActive = false;
++#endif
+ 		}
+ 
+ 		/* Advance SPU ADSR envelopes on the audio-timing thread, NOT from the
+@@ -272,6 +317,30 @@ int intrThreadMain(void* data)
+ 		 * g_SpuMutex (never nested under g_intrMutex), throttles on the
+ 		 * SDL_GetTicks ms delta, no-op unless `adsr 1`. */
+ 		PsyX_SPUAL_Update();
++#ifdef __linux__
++		if (idleSleep)
++		{
++			/* Two RGDS instances otherwise burn two cores between timer events.
++			 * Sub-millisecond sleeps preserve the 577.8 Hz sequencer deadline;
++			 * SDL_Delay's millisecond quantum would slow that clock down. */
++			double idle = 0.001;
++			const double elapsed = (SDL_GetPerformanceCounter() - timerOrigin) * counterSeconds;
++			const double vblLeft = vblEpoch + (g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL)
++			                     - elapsed;
++			if (vblLeft < idle) idle = vblLeft;
++			if (g_rcnt2_timer_active)
++			{
++				const double rcntLeft = rcnt2Epoch + rcnt2Period - elapsed;
++				if (rcntLeft < idle) idle = rcntLeft;
++			}
++			idle -= 0.00005;
++			if (idle > 0)
++			{
++				const struct timespec delay = { 0, (long)(idle * 1e9) };
++				nanosleep(&delay, NULL);
++			}
++		}
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -835,11 +904,15 @@ int g_PsyX_WheelDownFrames = 0;
+  * needs every notch, which the 2-frame latch above merges. */
+ int g_PsyX_WheelNotches    = 0;
+ 
++extern "C" { int (*g_PsyX_EventHook)(SDL_Event* event) = NULL; }
++
+ void PsyX_Sys_DoPollEvent()
+ {
+ 	SDL_Event event;
+ 	while (SDL_PollEvent(&event))
+ 	{
++		if (g_PsyX_EventHook && g_PsyX_EventHook(&event))
++			continue;
+ 		switch (event.type)
+ 		{
+ 			case SDL_CONTROLLERDEVICEADDED:
+@@ -1339,6 +1412,9 @@ void PsyX_WaitForTimestep(int count)
+ 	if (!g_skipSwapInterval)
+ 	{	
+ 		static int swapLastVbl = 0;
++#ifdef __linux__
++		static const bool idleSleep = getenv("SH_RGDS") != NULL;
++#endif
+ 
+ 		int vbl;
+ 		do
+@@ -1347,6 +1423,14 @@ void PsyX_WaitForTimestep(int count)
+ 			emscripten_sleep(0);
+ #endif
+ 			vbl = PsyX_Sys_GetVBlankCount();
++#ifdef __linux__
++			if (idleSleep && vbl - swapLastVbl < count)
++			{
++				/* Yield the core while the interrupt thread owns the next tick. */
++				const struct timespec delay = { 0, 100000 };
++				nanosleep(&delay, NULL);
++			}
++#endif
+ 		}
+ 		while (vbl - swapLastVbl < count);
+ 
+@@ -1392,13 +1476,16 @@ void PsyX_Shutdown()
+ 	}
+ 	SHUTDOWN_STAGE("vblank thread joined");
+ 
++	/* GL objects go while their context is still current: destroying the window
++	 * first left GR_Shutdown calling GL with nothing current, which segfaulted
++	 * every exit on Linux (Mesa and the RG DS Mali driver alike). */
++	GR_Shutdown();
++	SHUTDOWN_STAGE("GR_Shutdown done");
++
+ 	SDL_DestroyWindow(g_window);
+ 	g_window = NULL;
+ 	SHUTDOWN_STAGE("window destroyed");
+ 
+-	GR_Shutdown();
+-	SHUTDOWN_STAGE("GR_Shutdown done");
+-
+ 	SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+ 
+ 	SDL_Quit();
+diff --git a/src/gpu/PsyX_GPU.cpp b/src/gpu/PsyX_GPU.cpp
+index 0b71c97..e0408c7 100644
+--- a/src/gpu/PsyX_GPU.cpp
++++ b/src/gpu/PsyX_GPU.cpp
+@@ -388,7 +388,12 @@ static unsigned s_wmDevPrims, s_wmPrecPrims;
+ extern "C" { double g_wmTParse = 0, g_wmTDraw = 0, g_wmTChunks = 0, g_wmTXform = 0, g_wmTMesh = 0; unsigned g_wmSplits = 0, g_wmVerts = 0, g_wmOtDraws = 0; }
+ static Uint64 s_wmFrameStart = 0;
+ /* Probe-frame cycle counts per GT4 parse step (world prims are GT4). */
++#if defined(__i386__) || defined(__x86_64__)
+ #include <x86intrin.h>
++#define PsyX_ProbeCounter() __rdtsc()
++#else
++#define PsyX_ProbeCounter() SDL_GetPerformanceCounter()
++#endif
+ static unsigned long long s_wmCyc[9];
+ static unsigned s_wmGt4;
+ /* Probe-frame parse cost by prim class: [code>>4], 16 = 0xB5 far quads,
+@@ -398,8 +403,8 @@ static unsigned long long s_wmClsCyc[18];
+ static unsigned s_wmClsN[18];
+ static unsigned long long s_wmTscStart;
+ extern "C" { double g_wmTGpu = 0; unsigned g_wmFarQuads = 0, g_wmFarSplits = 0, g_wmFarFlushes = 0, g_wmFarMeshKeys = 0, g_wmFarMeshDraws = 0, g_wmFarMeshQueued = 0; }
+-#define WM_CLS(i, stmt) do { if (g_PsxWholeMapProbe == 1) { unsigned long long _c0 = __rdtsc(); stmt; s_wmClsCyc[i] += __rdtsc() - _c0; s_wmClsN[i]++; } else { stmt; } } while (0)
+-#define WM_CYC(i, stmt) do { if (g_PsxWholeMapProbe == 1) { unsigned long long _c0 = __rdtsc(); stmt; s_wmCyc[i] += __rdtsc() - _c0; } else { stmt; } } while (0)
++#define WM_CLS(i, stmt) do { if (g_PsxWholeMapProbe == 1) { unsigned long long _c0 = PsyX_ProbeCounter(); stmt; s_wmClsCyc[i] += PsyX_ProbeCounter() - _c0; s_wmClsN[i]++; } else { stmt; } } while (0)
++#define WM_CYC(i, stmt) do { if (g_PsxWholeMapProbe == 1) { unsigned long long _c0 = PsyX_ProbeCounter(); stmt; s_wmCyc[i] += PsyX_ProbeCounter() - _c0; } else { stmt; } } while (0)
+ static unsigned s_wmBfCalls, s_wmBfFallback, s_wmBfCull, s_wmCaptured, s_wmParsed, s_wmAffineVerts, s_wmPreciseVerts;
+ static float s_wmWMin, s_wmWMax;
+ static unsigned char s_lastLookupFar;
+@@ -456,7 +461,7 @@ extern "C" void PGXP_CoverageTick(void)
+ 			g_wmTChunks, g_wmTParse, g_wmTDraw, g_wmTXform, g_wmTMesh, g_wmOtDraws, g_wmSplits, g_wmVerts);
+ 		{
+ 			const double frameMs = (double)(SDL_GetPerformanceCounter() - s_wmFrameStart) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+-			const double cycPerMs = (frameMs > 0.0) ? (double)(__rdtsc() - s_wmTscStart) / frameMs : 1.0;
++			const double cycPerMs = (frameMs > 0.0) ? (double)(PsyX_ProbeCounter() - s_wmTscStart) / frameMs : 1.0;
+ 			char buf[1024];
+ 			int len = 0;
+ 			for (int c = 0; c < 18; c++)
+@@ -486,7 +491,7 @@ extern "C" void PGXP_CoverageTick(void)
+ 		s_wmDevPrims = s_wmPrecPrims = 0;
+ 		memset(s_wmCyc, 0, sizeof(s_wmCyc)); s_wmGt4 = 0;
+ 		memset(s_wmClsCyc, 0, sizeof(s_wmClsCyc)); memset(s_wmClsN, 0, sizeof(s_wmClsN));
+-		g_wmTGpu = 0; g_wmFarQuads = g_wmFarSplits = g_wmFarFlushes = g_wmFarMeshKeys = g_wmFarMeshDraws = g_wmFarMeshQueued = 0; s_wmTscStart = __rdtsc();
++		g_wmTGpu = 0; g_wmFarQuads = g_wmFarSplits = g_wmFarFlushes = g_wmFarMeshKeys = g_wmFarMeshDraws = g_wmFarMeshQueued = 0; s_wmTscStart = PsyX_ProbeCounter();
+ 		g_wmTParse = g_wmTDraw = g_wmTChunks = g_wmTXform = g_wmTMesh = 0; g_wmSplits = g_wmVerts = g_wmOtDraws = 0;
+ 		s_wmFrameStart = SDL_GetPerformanceCounter();
+ 		g_PsxWholeMapProbe = 1;
+@@ -933,7 +938,8 @@ enum { SPLIT_DEPTH_DISABLED = 0, SPLIT_DEPTH_WORLD = 2, SPLIT_DEPTH_WORLD_FAR =
+  * depth channel (plan Step 3 skips the memset when PGXP is on; a reused packet
+  * address from a previous frame must then read as a miss, exactly like the
+  * s_shadow / s_affine tables already do). Inert while the memset still runs. */
+-struct SZEntry { uintptr_t key; uint32_t sz[4]; unsigned gen; unsigned char kind; unsigned char alpha; unsigned char far; };
++struct SZEntry { uintptr_t key; uint32_t sz[4]; unsigned gen; unsigned char kind; unsigned char alpha; unsigned char far; unsigned char wipe; };
++static_assert(sizeof(SZEntry) == 32 || sizeof(void*) != 8, "SZEntry grew; the table is 2^18 entries");
+ 
+ /* Per-prim ALPHA (0..255, default 255 = opaque semantics unchanged), armed like
+  * the SZ payload and carried in the same entry. BM_AVERAGE is real
+@@ -953,6 +959,13 @@ extern "C" void PsyX_SetNextPrimAlpha(int a)
+ 	g_primAlphaNext = a;
+ }
+ static SZEntry g_szTable[SZ_TABLE_SIZE];
++/* The PGXP-off wipe used to memset this 8 MiB table at every GsDrawOt (16 MiB a
++ * frame of stores on a Cortex-A55, all of it evicting the caches). Advancing a
++ * wipe stamp instead makes every older entry read exactly like the zeroed slot the
++ * memset left: probes stop at it, inserts reclaim it. The stamp is one byte (the
++ * entry's padding), so the real memset still runs once every 255 wipes. */
++static unsigned char s_szWipe = 1;
++static inline bool SzLive(const SZEntry& e) { return e.key != 0 && e.wipe == s_szWipe; }
+ 
+ /* --- Depth channel Step 3 (docs: PGXP_PR51_Vetting.md; live only when PGXP is
+  * on and outside the inventory item pass) ---------------------------------
+@@ -1126,8 +1139,52 @@ extern "C" void PsyX_CancelNextPrimSz(void)
+ 	g_primSzNextFar = 0;
+ }
+ 
++/* RG DS seam fill: prims of characters and held items stay unexpanded (their
++ * layered parts, an ear under the hair, would peek through each other's edges).
++ * The game raises g_PsyX_RgdsNoSeam around those draws and addPrim records the
++ * prims here, stamped with the frame generation (bumped at EndScene, after the
++ * frame's parse); the SZ table cannot carry it: with PGXP off it is wiped at the
++ * start of GsDrawOt, before the parse reads it. */
++extern "C" { int g_PsyX_RgdsNoSeam = 0; }
++#define RGDS_NOSEAM_SIZE 8192
++static struct { uintptr_t key; unsigned gen; } s_rgdsNoSeam[RGDS_NOSEAM_SIZE];
++
++static void RgdsNoSeamPut(uintptr_t key)
++{
++	const int slot = (int)((key >> 2) & (RGDS_NOSEAM_SIZE - 1));
++	for (int i = 0; i < 8; i++)
++	{
++		const int s = (slot + i) & (RGDS_NOSEAM_SIZE - 1);
++		if (s_rgdsNoSeam[s].gen != s_pgxpGen || s_rgdsNoSeam[s].key == key)
++		{
++			s_rgdsNoSeam[s].key = key;
++			s_rgdsNoSeam[s].gen = s_pgxpGen;
++			return;
++		}
++	}
++	s_rgdsNoSeam[slot].key = key;
++	s_rgdsNoSeam[slot].gen = s_pgxpGen;
++}
++
++static bool RgdsNoSeamHas(const void* prim)
++{
++	const uintptr_t key = (uintptr_t)prim;
++	const int slot = (int)((key >> 2) & (RGDS_NOSEAM_SIZE - 1));
++	for (int i = 0; i < 8; i++)
++	{
++		const int s = (slot + i) & (RGDS_NOSEAM_SIZE - 1);
++		if (s_rgdsNoSeam[s].gen != s_pgxpGen)
++			return false;
++		if (s_rgdsNoSeam[s].key == key)
++			return true;
++	}
++	return false;
++}
++
+ extern "C" void PsyX_CaptureGteDepths(void* prim)
+ {
++	if (g_PsyX_RgdsNoSeam)
++		RgdsNoSeamPut((uintptr_t)prim);
+ 	/* PGXP: if the next prim was flagged screen-space (billboards), record it so
+ 	 * the draw side forces affine. Per-prim, then cleared. */
+ 	if (g_primPgxpForceAffine || g_primNoFlashlight) {
+@@ -1169,8 +1226,9 @@ extern "C" void PsyX_CaptureGteDepths(void* prim)
+ 		/* Stale-gen slots are reclaimable (same probe rule as Shadow_Put/
+ 		 * AffineStore): identical placement while the memset wipes the table
+ 		 * (stale entries then never exist mid-probe). */
+-		if (g_szTable[s].key == 0 || g_szTable[s].key == key || g_szTable[s].gen != s_pgxpGen) {
++		if (!SzLive(g_szTable[s]) || g_szTable[s].key == key || g_szTable[s].gen != s_pgxpGen) {
+ 			g_szTable[s].key = key;
++			g_szTable[s].wipe = s_szWipe;
+ 			g_szTable[s].sz[0] = s0; g_szTable[s].sz[1] = s1;
+ 			g_szTable[s].sz[2] = s2; g_szTable[s].sz[3] = s3;
+ 			g_szTable[s].gen = s_pgxpGen;
+@@ -1184,6 +1242,7 @@ extern "C" void PsyX_CaptureGteDepths(void* prim)
+ 	// Probe exhausted — overwrite initial slot
+ 	if (g_PsxUsePgxp) s_dbgSzExhaust++;
+ 	g_szTable[slot].key = key;
++	g_szTable[slot].wipe = s_szWipe;
+ 	g_szTable[slot].alpha = (unsigned char)g_primAlphaNext;
+ 	g_primAlphaNext = 255;
+ 	g_szTable[slot].sz[0] = s0; g_szTable[slot].sz[1] = s1;
+@@ -1205,7 +1264,7 @@ static int SplitDepthForPrim(const void* prim)
+ 	int slot = (int)((key >> 2) & SZ_TABLE_MASK);
+ 	for (int i = 0; i < 16; i++) {
+ 		int s = (slot + i) & SZ_TABLE_MASK;
+-		if (g_szTable[s].key == key)
++		if (SzLive(g_szTable[s]) && g_szTable[s].key == key)
+ 		{
+ 			/* Stale-gen = captured a previous frame, not this one: a reused
+ 			 * packet address must not inherit last frame's kind. (Function is
+@@ -1218,7 +1277,7 @@ static int SplitDepthForPrim(const void* prim)
+ 			if (g_szTable[s].kind == SZ_KIND_FLAT) { s_dbgSplitWorld++; return g_szTable[s].far ? SPLIT_DEPTH_WORLD_FAR : SPLIT_DEPTH_WORLD; }
+ 			return SPLIT_DEPTH_DISABLED;
+ 		}
+-		if (g_szTable[s].key == 0)
++		if (!SzLive(g_szTable[s]))
+ 			break;
+ 	}
+ 	return SPLIT_DEPTH_DISABLED;
+@@ -1250,8 +1309,11 @@ extern "C" void PsyX_ClearGteDepthTable(void)
+ 		 * with parse hit=0 — the machinery was inert in gameplay. Off path
+ 		 * wipes exactly as before (byte-identical); a runtime PGXP on->off
+ 		 * toggle self-heals here on the first off-frame GsDrawOt. */
+-		if (!g_PsxUsePgxp)
++		if (!g_PsxUsePgxp && ++s_szWipe == 0)
++		{
+ 			memset(g_szTable, 0, sizeof(g_szTable));
++			s_szWipe = 1;
++		}
+ 	}
+ 	else if (g_PsxUsePgxp)
+ 		s_dbgWipeSkips++;
+@@ -1271,7 +1333,7 @@ static unsigned char PsyX_LookupGteAlpha(const void* prim)
+ 	int slot = (int)((key >> 2) & SZ_TABLE_MASK);
+ 	for (int i = 0; i < 16; i++) {
+ 		int s = (slot + i) & SZ_TABLE_MASK;
+-		if (g_szTable[s].key == key)
++		if (SzLive(g_szTable[s]) && g_szTable[s].key == key)
+ 			/* Gen-validate ALWAYS (unlike the depths lookup's PGXP-gated
+ 			 * check): arm and consume are same-frame, so a match from an
+ 			 * earlier gen is a reused packet address, not this prim. Without
+@@ -1279,7 +1341,7 @@ static unsigned char PsyX_LookupGteAlpha(const void* prim)
+ 			 * whatever landed on that address later -- the load screen drew
+ 			 * Harry semi-transparent, ghosting over the uncleared background. */
+ 			return (g_szTable[s].gen == s_pgxpGen) ? g_szTable[s].alpha : 255;
+-		if (g_szTable[s].key == 0) break;
++		if (!SzLive(g_szTable[s])) break;
+ 	}
+ 	return 255;
+ }
+@@ -1290,7 +1352,7 @@ static bool PsyX_LookupGteDepths(const void* prim, uint32_t* sz, unsigned char*
+ 	int slot = (int)((key >> 2) & SZ_TABLE_MASK);
+ 	for (int i = 0; i < 16; i++) {
+ 		int s = (slot + i) & SZ_TABLE_MASK;
+-		if (g_szTable[s].key == key) {
++		if (SzLive(g_szTable[s]) && g_szTable[s].key == key) {
+ 			/* Gen-validate gated on PGXP: the legacy pgxpZBuffer path (PGXP
+ 			 * off) keeps its exact historical behavior; when PGXP is on a
+ 			 * reused packet address from a prior frame reads as a miss. */
+@@ -1305,7 +1367,7 @@ static bool PsyX_LookupGteDepths(const void* prim, uint32_t* sz, unsigned char*
+ 			s_lastLookupFar = g_szTable[s].far;
+ 			return true;
+ 		}
+-		if (g_szTable[s].key == 0) break;
++		if (!SzLive(g_szTable[s])) break;
+ 	}
+ 	return false;
+ }
+@@ -2030,6 +2092,89 @@ static inline bool PgxpAllBeyondViewSpace(const GrVertex* v, int n)
+ 	return true;
+ }
+ 
++/* RG DS seam fill (SH_RGDS_SEAM_EXPAND, in PS1 pixels; 0.35 by default with SH_RGDS,
++ * 0 turns it off). Polygon edges that do not share vertices meet only to within PS1
++ * integer rounding. At 320x240 those slivers rarely cover a pixel centre; at the
++ * 1024x768 render they show as hairlines of the fog colour that flicker while the
++ * camera moves. Opaque 3D polygons get each edge pushed out by this much (mitred,
++ * capped at twice) so neighbours overlap; the fragment shader clamps their UVs to the
++ * polygon's own bounds (RGDS_SEAM_CLAMP) so the fringe repeats the edge texel. */
++/* Read from the environment on first use; the SEAM console command overrides it. */
++extern "C" { float g_PsyX_RgdsSeamExpand = -1.0f; }
++static bool  s_rgdsExpandNext;
++
++float PsyX_RgdsSeamExpand()
++{
++	if (g_PsyX_RgdsSeamExpand < 0.0f)
++	{
++		const char* value = getenv("SH_RGDS_SEAM_EXPAND");
++		g_PsyX_RgdsSeamExpand = getenv("SH_RGDS") ? (value ? (float)atof(value) : 0.35f) : 0.0f;
++		if (!(g_PsyX_RgdsSeamExpand > 0.0f && g_PsyX_RgdsSeamExpand <= 2.0f))
++			g_PsyX_RgdsSeamExpand = 0.0f;
++		eprintf("*RG DS seam expand: %.2f PS1 px\n", g_PsyX_RgdsSeamExpand);
++	}
++	return g_PsyX_RgdsSeamExpand;
++}
++
++static bool RgdsSeamPrim(const void* prim)
++{
++	return g_PsyX_RgdsSeamExpand != 0.0f && !RgdsNoSeamHas(prim);
++}
++
++static void RgdsExpandPoly(GrVertex* v, int n)
++{
++	const float e = PsyX_RgdsSeamExpand();
++	int   idx[4], m = 0, i;
++	float area = 0.0f, nx[4], ny[4];
++
++	if (e <= 0.0f)
++		return;
++	/* A triangle sent as a quad repeats a corner: work on the distinct corners. */
++	for (i = 0; i < n; i++)
++		if (m == 0 || v[i].x != v[idx[m - 1]].x || v[i].y != v[idx[m - 1]].y)
++			idx[m++] = i;
++	if (m > 1 && v[idx[m - 1]].x == v[idx[0]].x && v[idx[m - 1]].y == v[idx[0]].y)
++		m--;
++	if (m < 3)
++		return;
++	for (i = 0; i < m; i++)
++	{
++		const GrVertex& a = v[idx[i]];
++		const GrVertex& b = v[idx[(i + 1) % m]];
++		area += a.x * b.y - b.x * a.y;
++	}
++	if (fabsf(area) < 1.0f)
++		return; /* sliver: leave it alone */
++	const float sign = area > 0.0f ? 1.0f : -1.0f;
++	for (i = 0; i < m; i++) /* outward normal of edge i -> i+1 */
++	{
++		const float dx = v[idx[(i + 1) % m]].x - v[idx[i]].x;
++		const float dy = v[idx[(i + 1) % m]].y - v[idx[i]].y;
++		const float len = sqrtf(dx * dx + dy * dy);
++		nx[i] = sign * dy / len;
++		ny[i] = -sign * dx / len;
++	}
++	float ox[4], oy[4];
++	for (i = 0; i < m; i++)
++	{
++		const int   prev = (i + m - 1) % m;
++		const float mx = nx[prev] + nx[i], my = ny[prev] + ny[i];
++		float d = 1.0f + nx[prev] * nx[i] + ny[prev] * ny[i];
++		if (d < 0.5f)
++			d = 0.5f;
++		ox[i] = mx * e / d;
++		oy[i] = my * e / d;
++	}
++	for (i = 0; i < n; i++)
++	{
++		int k = 0;
++		while (k < m - 1 && (v[idx[k]].x != v[i].x || v[idx[k]].y != v[i].y))
++			k++;
++		v[i].x += ox[k];
++		v[i].y += oy[k];
++	}
++}
++
+ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, ushort gteidx)
+ {
+ 	assert(p0);
+@@ -2104,6 +2249,10 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE*
+ 			vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = 0.0f;
+ 	}
+ 
++	if (s_rgdsExpandNext && !g_PsxUsePgxp && vertex[0].geom3d == 1.0f)
++		RgdsExpandPoly(vertex, 3);
++	s_rgdsExpandNext = false;
++
+ 	ScreenCoordsToEmulator(vertex, 3);
+ }
+ 
+@@ -2178,6 +2327,10 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2,
+ 			vertex[0].ppw = vertex[1].ppw = vertex[2].ppw = vertex[3].ppw = 0.0f;
+ 	}
+ 
++	if (s_rgdsExpandNext && !g_PsxUsePgxp && vertex[0].geom3d == 1.0f)
++		RgdsExpandPoly(vertex, 4);
++	s_rgdsExpandNext = false;
++
+ 	ScreenCoordsToEmulator(vertex, 4);
+ }
+ 
+@@ -3189,6 +3342,8 @@ int g_PsxWorldDepthAlways = 1;
+ 
+ int g_PsxDbgAddMode = 1;
+ 
++extern "C" int g_RgdsSwapCount;
++
+ void DrawSplit(const GPUDrawSplit& split)
+ {
+ 	const bool isAdditive = (split.blendMode == BM_ADD || split.blendMode == BM_ADD_QUATER_SOURCE);
+@@ -3211,6 +3366,23 @@ void DrawSplit(const GPUDrawSplit& split)
+ 			bigSplitLog++;
+ 		}
+ 	}
++	/* RG DS diagnostics: SH_RGDS_SPLITLOG_FRAME=N logs every split of the N-th presented
++	 * frame, to tell what the screen-sized layers are. */
++	{
++		static const int s_logFrame = (getenv("SH_RGDS") && getenv("SH_RGDS_SPLITLOG_FRAME"))
++			? atoi(getenv("SH_RGDS_SPLITLOG_FRAME")) : -1;
++		if (g_RgdsSwapCount == s_logFrame && split.numVerts > 0)
++		{
++			const GrVertex& v = g_vertexBuffer[split.startVertex];
++			eprintf("[SPLITLOG] frame=%d split=%d verts=%u blend=%d fmt=%d tex=%u prim=%d dfe=%d clip=(%d,%d %dx%d) "
++			        "v0=(%d,%d) uv=(%d,%d) rgba=(%d,%d,%d,%d) bright=%d fog=%d page=%d clut=%d glyph=%d\n",
++			        s_logFrame, (int)(&split - (const GPUDrawSplit*)g_splits), split.numVerts, (int)split.blendMode,
++			        (int)split.texFormat, (unsigned)split.textureId, split.drawPrimMode, split.drawenv.dfe,
++			        split.drawenv.clip.x, split.drawenv.clip.y, split.drawenv.clip.w, split.drawenv.clip.h,
++			        v.x, v.y, v.u, v.v, v.r, v.g, v.b, v.a, v.bright, v._p0, v.page, v.clut, split.isGlyph);
++		}
++	}
++
+ 	if(split.debugText)
+ 		GR_PushDebugLabel(split.debugText);
+ 
+@@ -3576,8 +3748,11 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
+ 			//      VirtualQuery; rely on the 1<<20 node safety counter.
+ 			uintptr_t nextPtr = reinterpret_cast<uintptr_t>(nextPrim(basePacket));
+ 			if (nextPtr < 0x10000 ||
+-			    nextPtr == static_cast<uintptr_t>(-1) ||
+-			    nextPtr >= 0x7FFFFFFFFFFFULL) {
++			    nextPtr == static_cast<uintptr_t>(-1)
++#ifdef _WIN32
++			    || nextPtr >= 0x7FFFFFFFFFFFULL
++#endif
++			    ) {
+ 				static int s_badNextLogged = 0;
+ 				if (s_badNextLogged < 16) {
+ 					eprintinfo("[OT] bad nextPtr=0x%llX at %p — chain walk halted\n",
+@@ -3817,6 +3992,7 @@ static int ProcessFlatPoly(P_TAG* polyTag)
+ 
+ 	const bool shadeTexOn = (polyTag->code & 1) == 0;
+ 	const bool semiTrans = (polyTag->code & 2);
++	s_rgdsExpandNext = !semiTrans && RgdsSeamPrim(polyTag);
+ 	const int primSubType = polyTag->code & 0x0C;
+ 
+ 	switch (primSubType)
+@@ -3929,6 +4105,7 @@ static int ProcessGouraudPoly(P_TAG* polyTag)
+ 
+ 	const bool shadeTexOn = true;
+ 	const bool semiTrans = (polyTag->code & 2);
++	s_rgdsExpandNext = !semiTrans && RgdsSeamPrim(polyTag);
+ 	const int primSubType = polyTag->code & 0x0C;
+ 
+ 	switch (primSubType)
+diff --git a/src/pad/PsyX_pad.cpp b/src/pad/PsyX_pad.cpp
+index cca430f..f381349 100644
+--- a/src/pad/PsyX_pad.cpp
++++ b/src/pad/PsyX_pad.cpp
+@@ -279,6 +279,119 @@ void PsyX_Pad_Debug_ListControllers()
+ }
+ 
+ // Opens specific system controller and assigns to specified slot
++/* RG DS Plus port: face-button swaps for this game only, a mask: 1 = A<->B,
++ * 2 = X<->Y. Rewriting the SDL mapping of the opened GUID moves every consumer at
++ * once (PSX pad word, the port's raw action binds, button events), without touching
++ * the firmware's mapping. SDL keeps one mapping per GUID for the whole process, so a
++ * GUID is swapped exactly once: a second rewrite after a replug would swap it back. */
++int g_cfg_swapFaceButtons = 0;
++static SDL_JoystickGUID s_swappedGuids[8];
++static int s_swappedGuidCount = 0;
++
++static void PsyX_Pad_ApplyFaceSwap(SDL_GameController* gc)
++{
++	static const char* const pairs[4][2] = { { "a:", "b:" }, { "b:", "a:" }, { "x:", "y:" }, { "y:", "x:" } };
++	char* map;
++	char* out;
++	const char* values[4] = { NULL, NULL, NULL, NULL };
++	int lengths[4] = { 0, 0, 0, 0 };
++	SDL_JoystickGUID guid;
++	size_t size;
++	int i;
++
++	if (!g_cfg_swapFaceButtons || !gc)
++		return;
++	guid = SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(gc));
++	for (i = 0; i < s_swappedGuidCount; i++)
++		if (!memcmp(&s_swappedGuids[i], &guid, sizeof(guid)))
++			return;
++	map = SDL_GameControllerMapping(gc);
++	if (!map)
++		return;
++
++	for (const char* field = strchr(map, ','); field; field = strchr(field + 1, ','))
++	{
++		const char* start = field + 1;
++		const char* end = strchr(start, ',');
++		for (i = 0; i < 4; i++)
++		{
++			if (!strncmp(start, pairs[i][0], 2))
++			{
++				values[i] = start + 2;
++				lengths[i] = (int)((end ? end : start + strlen(start)) - values[i]);
++			}
++		}
++	}
++	if (((g_cfg_swapFaceButtons & 1) && (!values[0] || !values[1])) ||
++		((g_cfg_swapFaceButtons & 2) && (!values[2] || !values[3])))
++	{
++		eprintwarn("[PAD] face-button swap skipped: mapping lacks a/b/x/y: %s\n", map);
++		SDL_free(map);
++		return;
++	}
++
++	size = strlen(map) + 64;
++	out = (char*)SDL_malloc(size);
++	if (!out)
++	{
++		SDL_free(map);
++		return;
++	}
++	out[0] = '\0';
++	{
++		const char* cursor = map;
++		size_t used = 0;
++		while (*cursor)
++		{
++			const char* end = strchr(cursor, ',');
++			size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
++			int replaced = 0;
++			if (cursor != map && length > 2)
++			{
++				for (i = 0; i < 4; i++)
++				{
++					if (!(g_cfg_swapFaceButtons & (i < 2 ? 1 : 2)))
++						continue;
++					if (!strncmp(cursor, pairs[i][0], 2))
++					{
++						int source = i ^ 1;
++						used += SDL_snprintf(out + used, size - used, "%.2s%.*s", pairs[i][0], lengths[source], values[source]);
++						replaced = 1;
++						break;
++					}
++				}
++			}
++			if (!replaced)
++				used += SDL_snprintf(out + used, size - used, "%.*s", (int)length, cursor);
++			if (!end)
++				break;
++			used += SDL_snprintf(out + used, size - used, ",");
++			cursor = end + 1;
++		}
++	}
++
++	if (SDL_GameControllerAddMapping(out) >= 0)
++	{
++		if (s_swappedGuidCount < (int)(sizeof(s_swappedGuids) / sizeof(s_swappedGuids[0])))
++			s_swappedGuids[s_swappedGuidCount++] = guid;
++		eprintinfo("[PAD] face buttons swapped (%s%s%s): %s\n", (g_cfg_swapFaceButtons & 1) ? "A<->B" : "",
++			g_cfg_swapFaceButtons == 3 ? ", " : "", (g_cfg_swapFaceButtons & 2) ? "X<->Y" : "", out);
++	}
++	else
++	{
++		eprintwarn("[PAD] face-button swap rejected by SDL: %s\n", SDL_GetError());
++	}
++	SDL_free(out);
++	SDL_free(map);
++}
++
++extern "C" void PsyX_Pad_SetFaceSwap(int mask)
++{
++	g_cfg_swapFaceButtons = mask & 3;
++	for (int i = 0; i < MAX_CONTROLLERS; i++)
++		PsyX_Pad_ApplyFaceSwap(g_controllers[i].gc);
++}
++
+ void PsyX_Pad_OpenController(Sint32 deviceId, int slot)
+ {
+ 	PsyXController* controller = &g_controllers[slot];
+@@ -301,6 +414,7 @@ void PsyX_Pad_OpenController(Sint32 deviceId, int slot)
+ 	{
+ 		controller->instanceId =
+ 			SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller->gc));
++		PsyX_Pad_ApplyFaceSwap(controller->gc);
+ 
+ 		// assign device id automatically
+ 		if (controller->deviceId == -1)
+diff --git a/src/render/PsyX_render.cpp b/src/render/PsyX_render.cpp
+index d67eade..890d7c2 100644
+--- a/src/render/PsyX_render.cpp
++++ b/src/render/PsyX_render.cpp
+@@ -19,6 +19,7 @@
+ #include "PsyX/PsyX_globals.h"
+ #include "PsyX/PsyX_backend.h"
+ #include "PsyX/util/timer.h"
++#include "rgds_uniform_cache.h"
+ 
+ #if defined(_WIN32) && defined(RENDERER_OGL)
+ /* For the HWND that the ANGLE/EGL surface is created against. */
+@@ -29,6 +30,284 @@
+ #include <string.h>
+ #include <stdlib.h>
+ 
++extern ShaderID g_PreviousShader;
++/* Program switches retain uniforms; batch boundaries may include foreign GL writers. */
++static RgdsUniformCache s_rgdsUniforms;
++static bool s_rgdsLookupBound;
++
++static bool GR_RgdsCacheEnabled()
++{
++    static const bool enabled = getenv("SH_RGDS") &&
++        !(getenv("SH_RGDS_GL_CACHE") && strcmp(getenv("SH_RGDS_GL_CACHE"), "0") == 0);
++    return enabled && g_grIsGLES;
++}
++
++static bool GR_RgdsUniformUnchanged(GLint location, unsigned char kind, const void* data, size_t bytes)
++{
++    return GR_RgdsCacheEnabled() &&
++        s_rgdsUniforms.unchanged((uint32_t)g_PreviousShader, location, kind, data, bytes);
++}
++
++static void GR_CachedUniform1i(GLint location, GLint value)
++{
++    if (!GR_RgdsUniformUnchanged(location, 1, &value, sizeof(value))) glUniform1i(location, value);
++}
++
++static void GR_CachedUniform1f(GLint location, GLfloat value)
++{
++    if (!GR_RgdsUniformUnchanged(location, 2, &value, sizeof(value))) glUniform1f(location, value);
++}
++
++static void GR_CachedUniform2f(GLint location, GLfloat x, GLfloat y)
++{
++    const GLfloat values[] = {x, y};
++    if (!GR_RgdsUniformUnchanged(location, 3, values, sizeof(values))) glUniform2f(location, x, y);
++}
++
++static void GR_CachedUniform2fv(GLint location, GLsizei count, const GLfloat* values)
++{
++    if (count != 1) s_rgdsUniforms.invalidate();
++    if (count != 1 || !GR_RgdsUniformUnchanged(location, 3, values, 2 * sizeof(*values)))
++        glUniform2fv(location, count, values);
++}
++
++static void GR_CachedUniform3fv(GLint location, GLsizei count, const GLfloat* values)
++{
++    if (count != 1) s_rgdsUniforms.invalidate();
++    if (count != 1 || !GR_RgdsUniformUnchanged(location, 4, values, 3 * sizeof(*values)))
++        glUniform3fv(location, count, values);
++}
++
++static void GR_CachedUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* values)
++{
++    if (count != 1 || transpose != GL_FALSE) s_rgdsUniforms.invalidate();
++    if (count != 1 || transpose != GL_FALSE || !GR_RgdsUniformUnchanged(location, 5, values, 16 * sizeof(*values)))
++        glUniformMatrix4fv(location, count, transpose, values);
++}
++
++/* RG DS Plus (GLES): the split loop set the same viewport and texture unit 0 for
++ * every one of ~720 draws a frame, and re-set the three filter parameters on
++ * every bind of a 32-bit texture (~1900 calls a frame) although parameters live
++ * in the texture object. Each of those makes the driver revalidate state per
++ * draw. Viewport and unit are trusted only inside a batch (the same boundaries
++ * as the uniform cache). The filter record is per texture and outlives batches,
++ * so every other writer of texture parameters, and every delete (GL recycles
++ * names), clears it through the glad pointer hooks installed at start-up. */
++static int s_rgdsViewport[4];
++static bool s_rgdsViewportValid;
++static int s_rgdsActiveUnit = -1;
++
++static void GR_RgdsBatchBoundary()
++{
++    s_rgdsUniforms.invalidate();
++    s_rgdsLookupBound = false;
++    s_rgdsViewportValid = false;
++    s_rgdsActiveUnit = -1;
++}
++
++struct RgdsTextureFilter { GLuint tex; GLint min, mag; float aniso; };
++static RgdsTextureFilter s_rgdsFilters[4096];
++static GLuint s_rgdsBound2D[32];
++static unsigned s_rgdsHookUnit;
++static PFNGLDELETETEXTURESPROC s_rgdsRealDeleteTextures;
++static PFNGLACTIVETEXTUREPROC s_rgdsRealActiveTexture;
++static PFNGLBINDTEXTUREPROC s_rgdsRealBindTexture;
++static PFNGLTEXPARAMETERIPROC s_rgdsRealTexParameteri;
++static PFNGLTEXPARAMETERFPROC s_rgdsRealTexParameterf;
++static PFNGLTEXPARAMETERIVPROC s_rgdsRealTexParameteriv;
++static PFNGLTEXPARAMETERFVPROC s_rgdsRealTexParameterfv;
++
++static void GR_RgdsForgetFilter(GLuint tex)
++{
++    RgdsTextureFilter& entry = s_rgdsFilters[tex & 4095];
++    if (entry.tex == tex)
++        entry.tex = 0;
++}
++
++static void GR_RgdsForgetBoundFilter(GLenum target)
++{
++    if (target == GL_TEXTURE_2D && s_rgdsHookUnit < 32)
++        GR_RgdsForgetFilter(s_rgdsBound2D[s_rgdsHookUnit]);
++}
++
++static void APIENTRY GR_RgdsDeleteTextures(GLsizei n, const GLuint* textures)
++{
++    for (GLsizei i = 0; i < n; i++)
++    {
++        GR_RgdsForgetFilter(textures[i]);
++        for (unsigned unit = 0; unit < 32; unit++)
++            if (s_rgdsBound2D[unit] == textures[i]) s_rgdsBound2D[unit] = 0;
++    }
++    s_rgdsRealDeleteTextures(n, textures);
++}
++
++static void APIENTRY GR_RgdsActiveTexture(GLenum unit)
++{
++    s_rgdsHookUnit = unit - GL_TEXTURE0;
++    s_rgdsRealActiveTexture(unit);
++}
++
++static void APIENTRY GR_RgdsBindTexture(GLenum target, GLuint texture)
++{
++    if (target == GL_TEXTURE_2D && s_rgdsHookUnit < 32)
++        s_rgdsBound2D[s_rgdsHookUnit] = texture;
++    s_rgdsRealBindTexture(target, texture);
++}
++
++static void APIENTRY GR_RgdsTexParameteri(GLenum target, GLenum name, GLint value)
++{
++    GR_RgdsForgetBoundFilter(target);
++    s_rgdsRealTexParameteri(target, name, value);
++}
++
++static void APIENTRY GR_RgdsTexParameterf(GLenum target, GLenum name, GLfloat value)
++{
++    GR_RgdsForgetBoundFilter(target);
++    s_rgdsRealTexParameterf(target, name, value);
++}
++
++static void APIENTRY GR_RgdsTexParameteriv(GLenum target, GLenum name, const GLint* values)
++{
++    GR_RgdsForgetBoundFilter(target);
++    s_rgdsRealTexParameteriv(target, name, values);
++}
++
++static void APIENTRY GR_RgdsTexParameterfv(GLenum target, GLenum name, const GLfloat* values)
++{
++    GR_RgdsForgetBoundFilter(target);
++    s_rgdsRealTexParameterfv(target, name, values);
++}
++
++static void GR_RgdsInstallTextureHooks()
++{
++    if (!GR_RgdsCacheEnabled() || s_rgdsRealDeleteTextures)
++        return;
++    s_rgdsRealDeleteTextures = glad_glDeleteTextures;  glad_glDeleteTextures = GR_RgdsDeleteTextures;
++    s_rgdsRealActiveTexture = glad_glActiveTexture;    glad_glActiveTexture = GR_RgdsActiveTexture;
++    s_rgdsRealBindTexture = glad_glBindTexture;        glad_glBindTexture = GR_RgdsBindTexture;
++    s_rgdsRealTexParameteri = glad_glTexParameteri;    glad_glTexParameteri = GR_RgdsTexParameteri;
++    s_rgdsRealTexParameterf = glad_glTexParameterf;    glad_glTexParameterf = GR_RgdsTexParameterf;
++    s_rgdsRealTexParameteriv = glad_glTexParameteriv;  glad_glTexParameteriv = GR_RgdsTexParameteriv;
++    s_rgdsRealTexParameterfv = glad_glTexParameterfv;  glad_glTexParameterfv = GR_RgdsTexParameterfv;
++}
++
++/* RG DS Plus GPU options, on by default under SH_RGDS; "0" restores the original
++ * path. SH_RGDS_DIAG lists comma-separated diagnostics that deliberately drop
++ * work, and the picture with it, so that its cost shows up as FPS. They are not
++ * meant for play. */
++static bool s_rgdsLean, s_rgdsAluDecode, s_rgdsUntexturedFast;
++static bool s_rgdsDiagNoCapture, s_rgdsDiagNoFbClear, s_rgdsDiagNoDraw;
++
++/* Set by the game before PsyX_Initialise: 1 when nothing it is configured to do
++ * needs the compiled-out shader paths (texture/menu filtering, per-pixel
++ * flashlight). SH_RGDS_LEAN_SHADER=0/1 overrides it. */
++extern "C" { int g_PsyX_RgdsLeanShaderDefault = 0; }
++
++float PsyX_RgdsSeamExpand(); /* PsyX_GPU.cpp */
++
++static bool GR_RgdsEnv(const char* name, bool fallback)
++{
++    const char* value = getenv(name);
++    if (!getenv("SH_RGDS") || !g_grIsGLES)
++        return false;
++    return value ? strcmp(value, "1") == 0 : fallback;
++}
++
++static bool GR_RgdsDiag(const char* token)
++{
++    const char* list = getenv("SH_RGDS") ? getenv("SH_RGDS_DIAG") : NULL;
++    const size_t n = strlen(token);
++    for (const char* p = list ? strstr(list, token) : NULL; p; p = strstr(p + 1, token))
++        if ((p == list || p[-1] == ',') && (p[n] == 0 || p[n] == ','))
++            return true;
++    return false;
++}
++
++/* SH_RGDS_FBCLEAR_CACHE: every present blanks the feedback rects of the VRAM texture
++ * (GR_ClearAllFeedbackRects), two extra render passes on a tiler, although they stay
++ * blank until something writes that texture. The blank is skipped while it would
++ * repeat the last one: same texture, same rects, and nothing written there since.
++ * Writers are caught at the glad pointers, conservatively: any (re)specification or
++ * copy into the cleaned texture, an upload overlapping a rect, any draw bind of the
++ * VRAM framebuffer other than the blank itself. */
++static bool s_rgdsFbClearCache, s_rgdsFbClean, s_rgdsInFbClear;
++static GLuint s_rgdsFbCleanTex;
++static int s_rgdsFbCleanRects[3][4];
++static PFNGLTEXSUBIMAGE2DPROC s_rgdsRealTexSubImage2D;
++static PFNGLTEXIMAGE2DPROC s_rgdsRealTexImage2D;
++static PFNGLCOPYTEXSUBIMAGE2DPROC s_rgdsRealCopyTexSubImage2D;
++static PFNGLBINDFRAMEBUFFERPROC s_rgdsRealBindFramebuffer;
++extern GLuint g_glVRAMFramebuffer;
++
++static bool GR_RgdsCleanTextureBound()
++{
++    GLint bound = 0;
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++    return s_rgdsFbClean && (GLuint)bound == s_rgdsFbCleanTex;
++}
++
++static void APIENTRY GR_RgdsTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
++                                          GLenum format, GLenum type, const void* pixels)
++{
++    if (GR_RgdsCleanTextureBound())
++        for (int i = 0; i < 3; i++)
++        {
++            const int* r = s_rgdsFbCleanRects[i];
++            if (r[2] > 0 && r[3] > 0 && x < r[0] + r[2] && r[0] < x + w && y < r[1] + r[3] && r[1] < y + h)
++                s_rgdsFbClean = false;
++        }
++    s_rgdsRealTexSubImage2D(target, level, x, y, w, h, format, type, pixels);
++}
++
++static void APIENTRY GR_RgdsTexImage2D(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border,
++                                       GLenum format, GLenum type, const void* pixels)
++{
++    if (GR_RgdsCleanTextureBound())
++        s_rgdsFbClean = false;
++    s_rgdsRealTexImage2D(target, level, internal, w, h, border, format, type, pixels);
++}
++
++static void APIENTRY GR_RgdsCopyTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo, GLint x, GLint y,
++                                              GLsizei w, GLsizei h)
++{
++    if (GR_RgdsCleanTextureBound())
++        s_rgdsFbClean = false;
++    s_rgdsRealCopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
++}
++
++static void APIENTRY GR_RgdsBindFramebuffer(GLenum target, GLuint framebuffer)
++{
++    if (framebuffer != 0 && framebuffer == g_glVRAMFramebuffer && target != GL_READ_FRAMEBUFFER && !s_rgdsInFbClear)
++        s_rgdsFbClean = false;
++    s_rgdsRealBindFramebuffer(target, framebuffer);
++}
++
++static void GR_RgdsInstallFbClearHooks()
++{
++    if (!s_rgdsFbClearCache || s_rgdsRealBindFramebuffer)
++        return;
++    s_rgdsRealTexSubImage2D = glad_glTexSubImage2D;          glad_glTexSubImage2D = GR_RgdsTexSubImage2D;
++    s_rgdsRealTexImage2D = glad_glTexImage2D;                glad_glTexImage2D = GR_RgdsTexImage2D;
++    s_rgdsRealCopyTexSubImage2D = glad_glCopyTexSubImage2D;  glad_glCopyTexSubImage2D = GR_RgdsCopyTexSubImage2D;
++    s_rgdsRealBindFramebuffer = glad_glBindFramebuffer;      glad_glBindFramebuffer = GR_RgdsBindFramebuffer;
++}
++
++static void GR_RgdsReadOptions()
++{
++    s_rgdsLean           = GR_RgdsEnv("SH_RGDS_LEAN_SHADER", g_PsyX_RgdsLeanShaderDefault != 0);
++    s_rgdsAluDecode      = GR_RgdsEnv("SH_RGDS_ALU_DECODE", true);
++    s_rgdsUntexturedFast = GR_RgdsEnv("SH_RGDS_UNTEXTURED_FAST", true);
++    s_rgdsFbClearCache   = GR_RgdsEnv("SH_RGDS_FBCLEAR_CACHE", true);
++    GR_RgdsInstallFbClearHooks();
++    s_rgdsDiagNoCapture = GR_RgdsDiag("nocapture");
++    s_rgdsDiagNoFbClear = GR_RgdsDiag("nofbclear");
++    s_rgdsDiagNoDraw    = GR_RgdsDiag("nodraw");
++    if (getenv("SH_RGDS"))
++        eprintf("*RG DS GPU options: lean=%d alu_decode=%d untextured_fast=%d fbclear_cache=%d diag=%s\n",
++                s_rgdsLean, s_rgdsAluDecode, s_rgdsUntexturedFast, s_rgdsFbClearCache,
++                getenv("SH_RGDS_DIAG") ? getenv("SH_RGDS_DIAG") : "none");
++}
++
+ #ifdef _WIN32
+ 
+ #if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
+@@ -434,12 +713,10 @@ static void GR_ApplyTextureFilter(TextureID tex, TexFormat texFormat)
+ 		}
+ 	}
+ 
+-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
+-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
+-
++	float want = 0.0f;
+ 	if (s_glMaxAniso > 1.0f)
+ 	{
+-		float want = 1.0f;
++		want = 1.0f;
+ 
+ 		if (g_cfg_textureFilter >= 3)
+ 		{
+@@ -447,8 +724,25 @@ static void GR_ApplyTextureFilter(TextureID tex, TexFormat texFormat)
+ 			if (want > s_glMaxAniso) want = s_glMaxAniso;
+ 			if (want < 1.0f)         want = 1.0f;
+ 		}
++	}
++
++	RgdsTextureFilter* record = GR_RgdsCacheEnabled() ? &s_rgdsFilters[tex & 4095] : NULL;
++	if (record && record->tex == tex && record->min == minFilter && record->mag == magFilter && record->aniso == want)
++		return;
++
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
+ 
++	if (s_glMaxAniso > 1.0f)
+ 		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, want);
++
++	/* After the calls above: their hook forgets the bound texture's record. */
++	if (record)
++	{
++		record->tex = tex;
++		record->min = minFilter;
++		record->mag = magFilter;
++		record->aniso = want;
+ 	}
+ }
+ 
+@@ -1344,7 +1638,34 @@ int GR_InitialiseGLContext(char* windowName, int fullscreen)
+ 	if(g_windowWidth <= 0 || g_windowHeight <= 0)
+ 		windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+ 
+-	g_window = SDL_CreateWindow(windowName, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, g_windowWidth, g_windowHeight, windowFlags);
++	int windowPos = SDL_WINDOWPOS_UNDEFINED;
++	{
++		/* RG DS Plus: each process's window is created fullscreen on its own panel
++		 * (world DSI-2, menu DSI-1) under its final title, so the compositor maps
++		 * it once at panel size instead of tiling it and then moving and
++		 * fullscreening it. The launcher also need not arrange windows over sway
++		 * IPC, where every get_tree request leaves about 75 KB in sway's heap
++		 * until a reboot. */
++		const char* role = getenv("SH_RGDS_ROLE");
++		if (role && getenv("SH_RGDS"))
++		{
++			const int menu = strcmp(role, "inventory") == 0;
++			const char* want = menu ? "DSI-1" : "DSI-2";
++			for (int i = 0; i < SDL_GetNumVideoDisplays(); i++)
++			{
++				const char* name = SDL_GetDisplayName(i);
++				if (name && strstr(name, want))
++				{
++					windowPos = SDL_WINDOWPOS_UNDEFINED_DISPLAY(i);
++					windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
++					break;
++				}
++			}
++			windowName = (char*)(menu ? "Silent Hill RGDS [Bottom]" : "Silent Hill RGDS [Top]");
++		}
++	}
++
++	g_window = SDL_CreateWindow(windowName, windowPos, windowPos, g_windowWidth, g_windowHeight, windowFlags);
+ 
+ 	/* PC port: if MSAA was requested but the driver can't provide a multisample
+ 	 * pixel format, SDL_CreateWindow fails. Drop MSAA and retry once so the game
+@@ -1627,6 +1948,8 @@ int GR_InitialiseGLExt()
+ 	 * functions this renderer needs. Both, in this order. */
+ 	if (g_grIsGLES)
+ 		gladLoadGLES2Loader(loader);
++	GR_RgdsInstallTextureHooks();
++	GR_RgdsReadOptions();
+ #endif
+ 
+ 	const char* rend = (const char*)glGetString(GL_RENDERER);
+@@ -1932,6 +2255,7 @@ static void GR_NativeTrack(void)
+ 
+ void GR_BeginScene()
+ {
++	GR_RgdsBatchBoundary();
+ 	g_lastBoundTexture = 0;
+ 	GR_NativeTrack();
+ 
+@@ -2119,12 +2443,24 @@ int g_PsxFogToBlack = 0;
+ 	"	uniform sampler2D s_rgLut;\n"
+ 
+ #define GPU_DECODE_RG_FUNC\
++	"#ifdef RGDS_ALU_DECODE\n"\
++	/* RG DS Plus: the same decode in integer ALU, one dependent texture fetch
++	 * fewer per texel. Bit-identical for the snapped bytes every caller passes:
++	 * the table's v<<3 reads back as v*8/256 = v/32, its STP byte as 0.5. */\
++	"	vec4 lut(vec2 rg) {\n"\
++	"		ivec2 b = ivec2(rg * 255.0 + 0.5);\n"\
++	"		int c = b.x | (b.y << 8);\n"\
++	"		vec3 v = vec3(float(c & 31), float((c >> 5) & 31), float((c >> 10) & 31)) * (1.0 / 32.0);\n"\
++	"		return vec4(v, (c == 0) ? 0.0 : (((c >> 15) & 1) != 0 ? 0.5 : 1.0));\n"\
++	"	}\n"\
++	"#else\n"\
+ 	"	vec4 lut(vec2 rg) {\n"\
+ 	"		vec2 idx = (floor(rg * 255.0 + 0.5) + 0.5) * (1.0 / 256.0);\n"\
+ 	"		vec4 t = texture2D(s_rgLut, idx);\n"\
+ 	"		vec3 c = floor(t.rgb * 255.0 + 0.5) * (1.0 / 256.0);\n"\
+ 	"		return vec4(c, (rg.x + rg.y == 0.0) ? 0.0 : (t.w > 0.25 ? 0.5 : 1.0));\n"\
+-	"	}\n"
++	"	}\n"\
++	"#endif\n"
+ 
+ #if defined(RENDERER_OGL) || (OGLES_VERSION == 3)
+ 
+@@ -2267,6 +2603,9 @@ int g_PsxFogToBlack = 0;
+  * from contributing colour at all, and the fragment is only discarded when no
+  * tap is opaque. */
+ #define GPU_BILINEAR_SAMPLE_FUNC \
++	/* RGDS_LEAN (RG DS Plus): filtering is off in its config, and a uniform
++	 * branch still costs the uber-shader its registers on Mali. */\
++	"#ifndef RGDS_LEAN\n"\
+ 	/* Declared HERE, not with the other uniforms further down the shader:
+ 	 * GLSL requires a declaration before use, and these sampler functions are
+ 	 * emitted BEFORE that uniform block. Declaring it late cost a fragment
+@@ -2358,10 +2697,17 @@ int g_PsxFogToBlack = 0;
+ 	"		if (cov <= 0.0) { discard; }\n"\
+ 	"		g_tapCov = cov;\n"\
+ 	"		return acc / cov;\n"\
+-	"	}\n"
++	"	}\n"\
++	"#endif\n"
+ 
+ #define GPU_NEAREST_SAMPLE_FUNC \
+ 	"vec4 NearestTextureSample(vec2 P) {\n"\
++	/* RG DS seam fill: an expanded polygon's fringe repeats its own edge texel
++	 * instead of reading the neighbouring region of the page (PsyX_GPU.cpp). */\
++	"#ifdef RGDS_SEAM_CLAMP\n"\
++	"	if (v_uvlim.z > 0.0 || v_uvlim.w > 0.0)\n"\
++	"		P = clamp(P, v_uvlim.xy, v_uvlim.zw + vec2(0.999));\n"\
++	"#endif\n"\
+ 	"	vec2 rg = samplePSX(P);\n"\
+ 	"	if(rg.x + rg.y == 0.0) {discard;}\n"\
+ 	"	return lut(rg);\n"\
+@@ -2577,6 +2923,7 @@ int g_PsxFogToBlack = 0;
+ 	 * sewer water caustic, glows, fire -- which the PSX never lights. Dimming
+ 	 * them to the beam's base and adding the beam back on top made the water
+ 	 * near Harry blow out in the per-pixel modes while Classic was clean. */\
++	"#ifndef RGDS_LEAN\n"\
+ 	"		if (u_flashlightOn > 0 && u_fogToBlack == 0) {\n"\
+ 	"			vec3 flP = v_viewpos;\n"\
+ 	"			if (flP.z > 0.0) {\n"\
+@@ -2663,6 +3010,7 @@ int g_PsxFogToBlack = 0;
+ 	"				fragColor.rgb += flAlbedo * fl * (1.0 - clamp(v_fade, 0.0, 1.0));\n"\
+ 	"			}\n"\
+ 	"		}\n"\
++	"#endif\n"\
+ 	"		float fogAmt = clamp(v_fogAmount * u_fogStrength, 0.0, 1.0);\n"\
+ 	/* Plain PSX fog: the ramp reaches full fog at the map's fog distance and the
+ 	 * world is culled on its nearest vertex past it, so nothing drawn sits short
+@@ -2676,7 +3024,9 @@ int g_PsxFogToBlack = 0;
+ 	/* VOIDPROBE second frame: every fog-tail fragment is written as (fogAmt, is3d,
+ 	 * 200) so the histogram shows which fog levels the off-colour pixels carry, and
+ 	 * anything still at its real colour is proven to come from outside this tail. */\
+-	"		if (u_voidProbe > 0) fragColor = vec4(fogAmt, v_is3d, 200.0 / 255.0, 1.0);\n"
++	"#ifndef RGDS_LEAN\n"\
++	"		if (u_voidProbe > 0) fragColor = vec4(fogAmt, v_is3d, 200.0 / 255.0, 1.0);\n"\
++	"#endif\n"
+ 
+ #define GPU_FRAGMENT_SAMPLE_SHADER(bit) \
+ 	GPU_PACK_RG_FUNC\
+@@ -2692,8 +3042,27 @@ int g_PsxFogToBlack = 0;
+ 	"	uniform float u_pixelScale;\n"\
+ 	GPU_LIT_UNIFORMS\
+ 	"	void main() {\n"\
++	"#ifndef RGDS_LEAN\n"\
+ 	"		g_tapCov = 1.0;\n"\
+ 	"		g_tapWt = 1.0;\n"\
++	"#endif\n"\
++	/* RG DS Plus: u_untextured is set exactly when the 1x1 white placeholder
++	 * (0xFFFFFFFF) is bound, which every sampler path decodes to (1,1,1,0.5)
++	 * with full coverage and no discard, so the screen-sized fog/tint quads
++	 * need no texture fetch at all. */\
++	/* Diagnostics (SH_RGDS_DIAG=flat / notex): the floor of raster + blend, and
++	 * the cost of every texel fetch. Wrong pictures on purpose. */\
++	"#ifdef RGDS_DIAG_FLAT\n"\
++	"		fragColor = v_color;\n"\
++	"		return;\n"\
++	"#endif\n"\
++	"#ifdef RGDS_DIAG_NOTEX\n"\
++	"		fragColor = vec4(1.0, 1.0, 1.0, 0.5); if (false)\n"\
++	"#endif\n"\
++	"#ifdef RGDS_UNTEXTURED_FAST\n"\
++	"		if (u_untextured > 0) fragColor = vec4(1.0, 1.0, 1.0, 0.5); else\n"\
++	"#endif\n"\
++	"#ifndef RGDS_LEAN\n"\
+ 	/* bilinearFilter is the GATE (0 = off, 1 = 3D geometry only, 2 = this whole
+ 	 * frame); u_anisoTaps chooses HOW to filter once it passes. Keeping the two
+ 	 * separate is why anisotropic needs no new gate logic. */\
+@@ -2701,6 +3070,7 @@ int g_PsxFogToBlack = 0;
+ 	"			fragColor = (u_anisoTaps > 1.0) ? AnisoTextureSample(v_texcoord.xy)\n"\
+ 	"			                                : BilinearTextureSample(v_texcoord.xy);\n"\
+ 	"		else\n"\
++	"#endif\n"\
+ 	"			fragColor = NearestTextureSample(v_texcoord.xy);\n"\
+ 	/* Untextured prims bind a 1x1 white placeholder, which decodes through the
+ 	 * 5-bit table like any VRAM texel: 0xFFFF -> 248/256, so every flat or
+@@ -2720,8 +3090,10 @@ int g_PsxFogToBlack = 0;
+ 	 * is what makes a 2x2-texel snow flake a white square on a PC screen instead
+ 	 * of the round dot the same two pixels were on a TV. Colour only; alpha
+ 	 * keeps its meaning for BM_AVERAGE and for the cutout discard. */\
++	"#ifndef RGDS_LEAN\n"\
+ 	"		if (u_fogToBlack > 0 && g_tapWt > 0.0)\n"\
+ 	"			fragColor.rgb *= clamp(g_tapCov / g_tapWt, 0.0, 1.0);\n"\
++	"#endif\n"\
+ 	GPU_LIT_TAIL\
+ 	GPU_DITHERING_NO_VCOLOR\
+ 	/* Additive blend is dst*alpha + src (GR_SetBlendMode): STP set (0.5 from
+@@ -3056,6 +3428,19 @@ ShaderID GR_Shader_Compile(const char* source)
+ 		strcat(extra_fs_defines, affineDef);
+ 	}
+ 
++	if (s_rgdsLean)
++		strcat(extra_fs_defines, "#define RGDS_LEAN 1\n");
++	if (s_rgdsAluDecode)
++		strcat(extra_fs_defines, "#define RGDS_ALU_DECODE 1\n");
++	if (s_rgdsUntexturedFast)
++		strcat(extra_fs_defines, "#define RGDS_UNTEXTURED_FAST 1\n");
++	if (PsyX_RgdsSeamExpand() > 0.0f)
++		strcat(extra_fs_defines, "#define RGDS_SEAM_CLAMP 1\n");
++	if (GR_RgdsDiag("flat"))
++		strcat(extra_fs_defines, "#define RGDS_DIAG_FLAT 1\n");
++	if (GR_RgdsDiag("notex"))
++		strcat(extra_fs_defines, "#define RGDS_DIAG_NOTEX 1\n");
++
+ 	const char* vs_list[] = { GLSL_HEADER_VERT, extra_vs_defines, source };
+ 	const char* fs_list[] = { GLSL_HEADER_FRAG, extra_fs_defines, source };
+ 
+@@ -3204,6 +3589,7 @@ TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/
+ 
+ static void GR_InitialisePSXShader(GTEShader* sh, ShaderID shader)
+ {
++	s_rgdsUniforms.invalidate();
+ 	sh->shader = shader;
+ 
+ #if USE_OPENGL
+@@ -3435,7 +3821,7 @@ int GR_InitialisePSX()
+ 			glBindVertexArray(g_glVertexArray[i]);
+ 
+ 			glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[i]);
+-			glBufferData(GL_ARRAY_BUFFER, sizeof(GrVertex) * MAX_VERTEX_BUFFER_SIZE, NULL, GL_DYNAMIC_DRAW);
++			glBufferData(GL_ARRAY_BUFFER, sizeof(GrVertex) * (getenv("SH_RGDS") ? 4096 : MAX_VERTEX_BUFFER_SIZE), NULL, GL_DYNAMIC_DRAW);
+ 		}
+ 
+ 		glBindVertexArray(0);
+@@ -3473,7 +3859,7 @@ void GR_Ortho2D(float left, float right, float bottom, float top, float znear, f
+ 	};
+ 
+ #if USE_OPENGL
+-	glUniformMatrix4fv(u_projectionLoc, 1, GL_FALSE, ortho);
++	GR_CachedUniformMatrix4fv(u_projectionLoc, 1, GL_FALSE, ortho);
+ #endif
+ }
+ 
+@@ -3494,7 +3880,7 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
+ 	};
+ 
+ #if USE_OPENGL
+-	glUniformMatrix4fv(u_projection3DLoc, 1, GL_FALSE, persp);
++	GR_CachedUniformMatrix4fv(u_projection3DLoc, 1, GL_FALSE, persp);
+ #endif
+ }
+ 
+@@ -3575,8 +3961,32 @@ void GR_SetShader(const ShaderID shader)
+ }
+ 
+ 
++static void GR_BindDecodeTable()
++{
++	/* No legacy draw inside the batch changes unit 2; foreign passes invalidate it. */
++	if (!GR_RgdsCacheEnabled() || !s_rgdsLookupBound)
++	{
++		glActiveTexture(GL_TEXTURE2);
++		glBindTexture(GL_TEXTURE_2D, g_rgLutTexture);
++		s_rgdsLookupBound = true;
++		s_rgdsActiveUnit = 2;
++	}
++	if (!GR_RgdsCacheEnabled() || s_rgdsActiveUnit != 0)
++	{
++		glActiveTexture(GL_TEXTURE0);
++		s_rgdsActiveUnit = 0;
++	}
++}
++
+ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShader* shader)
+ {
++	if (s_rgdsLean && (g_PsyX_UsePerPixelFlashlight || g_cfg_textureFilter > 0 || g_cfg_menuFilter || g_PsxVoidProbeArmed))
++	{
++		static bool s_warned;
++		if (!s_warned)
++			eprintwarn("RG DS lean shader: filtering / per-pixel flashlight / void probe requested but compiled out; SH_RGDS_LEAN_SHADER=0 restores them\n");
++		s_warned = true;
++	}
+ 	switch (texFormat)
+ 	{
+ 	case TF_4_BIT:
+@@ -3741,47 +4151,47 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 	 * and forced-nearest sampling on actual 3D geometry (visible as
+ 	 * blocky tree leaves). */
+ 	if (u_pgxpEnabledLoc != -1)
+-		glUniform1i(u_pgxpEnabledLoc, g_PsxUsePgxp);
++		GR_CachedUniform1i(u_pgxpEnabledLoc, g_PsxUsePgxp);
+ 
+ 	/* PGXP depth normalize: prev-frame max SZ. Lets the vertex shader turn each
+ 	 * vertex's unquantized SZ3 into continuous NDC depth (Z-fight fix). */
+ 	if (u_szMaxLoc != -1)
+-		glUniform1f(u_szMaxLoc, PGXP_GetSzMax());
++		GR_CachedUniform1f(u_szMaxLoc, PGXP_GetSzMax());
+ 	if (u_worldFarBiasLoc != -1)
+-		glUniform1f(u_worldFarBiasLoc, (float)g_PsxPgxpWorldFarBias);
++		GR_CachedUniform1f(u_worldFarBiasLoc, (float)g_PsxPgxpWorldFarBias);
+ 	{
+ 		extern float g_PgxpFarWClamp;
+ 		if (u_pgxpFarWLoc != -1)
+-			glUniform1f(u_pgxpFarWLoc, g_PgxpFarWClamp);
++			GR_CachedUniform1f(u_pgxpFarWLoc, g_PgxpFarWClamp);
+ 	}
+ 
+ 	if (u_fogColorLoc != -1)
+-		glUniform3fv(u_fogColorLoc, 1, g_PsyX_FogColor);
++		GR_CachedUniform3fv(u_fogColorLoc, 1, g_PsyX_FogColor);
+ 	if (u_voidProbeLoc != -1)
+-		glUniform1i(u_voidProbeLoc, g_PsxVoidProbeArmed == 2 ? 1 : 0);
++		GR_CachedUniform1i(u_voidProbeLoc, g_PsxVoidProbeArmed == 2 ? 1 : 0);
+ 
+ 	if (u_fogToBlackLoc != -1)
+-		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
++		GR_CachedUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+ 
+ 	if (u_fogStrengthLoc != -1)
+-		glUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
++		GR_CachedUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
+ 
+ 	/* Per-pixel flashlight cone. u_flashlightOn is 0 unless BOTH the master
+ 	 * config flag and the per-frame game push are set, so the OFF path never
+ 	 * touches the spotlight branch (and the vsz>0 gate also keeps it off). */
+ 	if (u_flashlightOnLoc != -1)
+-		glUniform1i(u_flashlightOnLoc,
++		GR_CachedUniform1i(u_flashlightOnLoc,
+ 		            (g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive) ? 1 : 0);
+ 	/* Untextured splits bind g_whiteTexture; tell the lit tail so the beam's
+ 	 * albedo falls back to the vertex-lit color instead of full white. Keyed on
+ 	 * the caller's texture, not g_lastBoundTexture — this block runs before the
+ 	 * bind early-out, so it stays correct across program switches. */
+ 	if (u_untexturedLoc != -1)
+-		glUniform1i(u_untexturedLoc, texture == g_whiteTexture ? 1 : 0);
++		GR_CachedUniform1i(u_untexturedLoc, texture == g_whiteTexture ? 1 : 0);
+ 	if (u_flStyleLoc != -1)
+-		glUniform1i(u_flStyleLoc, g_PsyX_FlashlightStyle ? 1 : 0);
++		GR_CachedUniform1i(u_flStyleLoc, g_PsyX_FlashlightStyle ? 1 : 0);
+ 	if (u_flLightPosLoc != -1)
+-		glUniform3fv(u_flLightPosLoc, 1, g_PsyX_FlashlightPos);
++		GR_CachedUniform3fv(u_flLightPosLoc, 1, g_PsyX_FlashlightPos);
+ 
+ 	/* The cone collapses if any of these is degenerate -- a zero direction most of
+ 	 * all. Reported on change so a backend that lights wrongly can be compared
+@@ -3806,7 +4216,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 		}
+ 	}
+ 	if (u_flDirLoc != -1)
+-		glUniform3fv(u_flDirLoc, 1, g_PsyX_FlashlightDir);
++		GR_CachedUniform3fv(u_flDirLoc, 1, g_PsyX_FlashlightDir);
+ 	/* FPS mode swaps in its own (tighter/dimmer) cone size + brightness. */
+ 	float flIntensityActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightIntensityFps : g_PsyX_FlashlightIntensity;
+ 	float flSizeActive      = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps      : g_PsyX_FlashlightSize;
+@@ -3815,7 +4225,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 		flCol[0] = g_PsyX_FlashlightColor[0] * flIntensityActive;
+ 		flCol[1] = g_PsyX_FlashlightColor[1] * flIntensityActive;
+ 		flCol[2] = g_PsyX_FlashlightColor[2] * flIntensityActive;
+-		glUniform3fv(u_flColorLoc, 1, flCol);
++		GR_CachedUniform3fv(u_flColorLoc, 1, flCol);
+ 	}
+ 	/* Scale cone coverage by g_PsyX_FlashlightSize: a cone's solid angle is
+ 	 * ~proportional to (1 - cos(halfAngle)), so scaling that term scales the lit
+@@ -3830,12 +4240,12 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 		if (flInner < 0.05f) flInner = 0.05f;
+ 		if (flOuter < 0.05f) flOuter = 0.05f;
+ 		if (u_flInnerCosLoc != -1)
+-			glUniform1f(u_flInnerCosLoc, flInner);
++			GR_CachedUniform1f(u_flInnerCosLoc, flInner);
+ 		if (u_flOuterCosLoc != -1)
+-			glUniform1f(u_flOuterCosLoc, flOuter);
++			GR_CachedUniform1f(u_flOuterCosLoc, flOuter);
+ 	}
+ 	if (u_flRangeLoc != -1)
+-		glUniform1f(u_flRangeLoc, g_PsyX_FlashlightRange);
++		GR_CachedUniform1f(u_flRangeLoc, g_PsyX_FlashlightRange);
+ 
+ 	/* Flashlight shadow map: same gate as the depth pre-pass in DrawAllSplits, so the
+ 	 * shader only samples the shadow texture on frames one was actually rendered. */
+@@ -3875,37 +4285,31 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 		}
+ 
+ 		if (u_shadowOnLoc != -1)
+-			glUniform1i(u_shadowOnLoc, shadowOn);
++			GR_CachedUniform1i(u_shadowOnLoc, shadowOn);
+ 		if (shadowOn)
+ 		{
+ 			if (u_shadowMatrixLoc != -1)
+-				glUniformMatrix4fv(u_shadowMatrixLoc, 1, GL_FALSE, g_shadowLightMatrix);
++				GR_CachedUniformMatrix4fv(u_shadowMatrixLoc, 1, GL_FALSE, g_shadowLightMatrix);
+ 			if (u_shadowBiasLoc != -1)
+-				glUniform1f(u_shadowBiasLoc, g_PsyX_FlashlightShadowBias);
++				GR_CachedUniform1f(u_shadowBiasLoc, g_PsyX_FlashlightShadowBias);
+ 			if (u_shadowNormalOffsetLoc != -1)
+-				glUniform1f(u_shadowNormalOffsetLoc, g_PsyX_FlashlightShadowNormalOffset);
++				GR_CachedUniform1f(u_shadowNormalOffsetLoc, g_PsyX_FlashlightShadowNormalOffset);
+ 			if (u_shadowStrengthLoc != -1)
+-				glUniform1f(u_shadowStrengthLoc, g_PsyX_FlashlightShadowStrength);
++				GR_CachedUniform1f(u_shadowStrengthLoc, g_PsyX_FlashlightShadowStrength);
+ 			if (u_shadowClipLoc != -1)
+-				glUniform2f(u_shadowClipLoc, g_shadowZNear, g_shadowZFar);
++				GR_CachedUniform2f(u_shadowClipLoc, g_shadowZNear, g_shadowZFar);
+ 			if (u_shadowFadeDistLoc != -1)
+-				glUniform1f(u_shadowFadeDistLoc, g_PsyX_FlashlightShadowFadeDist);
++				GR_CachedUniform1f(u_shadowFadeDistLoc, g_PsyX_FlashlightShadowFadeDist);
+ 			if (u_shadowTexelLoc != -1)
+-				glUniform2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
++				GR_CachedUniform2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
+ 			glActiveTexture(GL_TEXTURE1);
+ 			glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
+ 			glActiveTexture(GL_TEXTURE0);
++			s_rgdsActiveUnit = 0;
+ 		}
+ 	}
+ 
+-	/* Re-assert the decode table on unit 2, like the shadow map above: the
+-	 * upload in GR_GenerateCommonTextures is a one-shot, and a pass that ever
+-	 * leaves another texture on that unit would otherwise decode every texel
+-	 * through it. Cheap next to the uniform pushes below, and it restores
+-	 * unit 0 so nothing downstream inherits a stray active unit. */
+-	glActiveTexture(GL_TEXTURE2);
+-	glBindTexture(GL_TEXTURE_2D, g_rgLutTexture);
+-	glActiveTexture(GL_TEXTURE0);
++	GR_BindDecodeTable();
+ 
+ 	/* Push the dither-force uniform every shader bind. Cheap (single
+ 	 * float upload) and ensures runtime config changes (if we add a
+@@ -3914,7 +4318,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 	 * 2D-only states (menus, logos, inventory) without changing the
+ 	 * config flag. */
+ 	if (u_ditherForceLoc != -1)
+-		glUniform1f(u_ditherForceLoc,
++		GR_CachedUniform1f(u_ditherForceLoc,
+ 		            (g_cfg_psxDither && !g_PsxDitherSuppressed) ? 1.0f : 0.0f);
+ 
+ 	/* Pixel scale = window width / PSX native (320). Scales the dither
+@@ -3925,7 +4329,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 		float pixelScale = (g_windowWidth > 0)
+ 			? ((float)g_windowWidth / 320.0f)
+ 			: 1.0f;
+-		glUniform1f(u_pixelScaleLoc, pixelScale);
++		GR_CachedUniform1f(u_pixelScaleLoc, pixelScale);
+ 	}
+ 
+ 	/* Filtering is a per-FRAME decision (the frame class flips with
+@@ -3970,7 +4374,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 	 * magnified four or five times and bilinear-smoothed run into blots -- the
+ 	 * blurred Japanese and Chinese menus. Everything else keeps the filter. */
+ 	if (u_bilinearFilterLoc != -1)
+-		glUniform1i(u_bilinearFilterLoc,
++		GR_CachedUniform1i(u_bilinearFilterLoc,
+ 		            g_PsxSplitIsGlyph       ? 0
+ 		            : g_PsxDitherSuppressed ? (g_cfg_menuFilter ? 2 : 0)
+ 		                                    : ((g_cfg_textureFilter > 0) ? 1 : 0));
+@@ -3990,7 +4394,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
+ 			if (taps < 1.0f)  taps = 1.0f;
+ 		}
+ 
+-		glUniform1f(u_anisoTapsLoc, taps);
++		GR_CachedUniform1f(u_anisoTapsLoc, taps);
+ 	}
+ 
+ 	if (g_dbg_texturelessMode) {
+@@ -4033,12 +4437,12 @@ void GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY,
+ 	// clamp the divisor to >=1 to keep coords finite. Valid slots are unaffected.
+ 	float vec[] = { 1.0f / (float)(width  > 0 ? width  : 1),
+ 	                1.0f / (float)(height > 0 ? height : 1) };
+-	glUniform2fv(u_texelSizeLoc, 1, vec);
++	GR_CachedUniform2fv(u_texelSizeLoc, 1, vec);
+ 
+ 	if(u_texOffsetLoc != -1)
+ 	{
+ 		float ofs[] = { (float)offsetX, (float)offsetY };
+-		glUniform2fv(u_texOffsetLoc, 1, ofs);
++		GR_CachedUniform2fv(u_texOffsetLoc, 1, ofs);
+ 	}
+ 
+ 	if(u_hiresHalfLoc != -1)
+@@ -4052,7 +4456,7 @@ void GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY,
+ 		float hh[2];
+ 		hh[0] = (hx > 0.5f) ? 0.5f : hx;
+ 		hh[1] = (hy > 0.5f) ? 0.5f : hy;
+-		glUniform2fv(u_hiresHalfLoc, 1, hh);
++		GR_CachedUniform2fv(u_hiresHalfLoc, 1, hh);
+ 	}
+ }
+ 
+@@ -5411,6 +5815,7 @@ static void GR_DrawFullscreenTexture(TextureID tex, int mode)
+ {
+ 	glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
+ 	glViewport(0, 0, g_windowWidth, g_windowHeight);
++	s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 
+ 	glDisable(GL_DEPTH_TEST);
+ 	glDisable(GL_BLEND);
+@@ -5758,6 +6163,7 @@ void GR_ShadowPassBegin(void)
+ 
+ 	glBindFramebuffer(GL_FRAMEBUFFER, g_shadowFBO);
+ 	glViewport(0, 0, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
++	s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 
+ 	glDisable(GL_SCISSOR_TEST);
+ 	glDisable(GL_STENCIL_TEST);
+@@ -5786,6 +6192,7 @@ void GR_ShadowPassEnd(void)
+ 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)s_shadowPrevFBO);
+ 	glViewport(s_shadowPrevViewport[0], s_shadowPrevViewport[1],
+ 	           s_shadowPrevViewport[2], s_shadowPrevViewport[3]);
++	s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 	glDepthFunc(GL_LEQUAL);  /* restore the renderer default; the pass set GL_LESS */
+ 
+ 	/* We changed program/depth/blend/scissor/stencil. Sentinels that never equal a
+@@ -5820,6 +6227,8 @@ void GR_CaptureLastFrame(void)
+ 		g_freezePresentedThisFrame = 0;
+ 		return;
+ 	}
++	if (s_rgdsDiagNoCapture)
++		return;
+ 
+ 	if (!g_freezeFrameTex)
+ 	{
+@@ -6194,6 +6603,7 @@ static void GR_PackFrameToVramRectGain(int x, int y, int w, int h, float gain)
+ 	glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
+ 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
+ 	glViewport(x, y, w, h);
++	s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 
+ 	glDisable(GL_DEPTH_TEST);
+ 	glDisable(GL_BLEND);
+@@ -6225,6 +6635,7 @@ static void GR_PackFrameToVramRectGain(int x, int y, int w, int h, float gain)
+ 	glEnable(GL_STENCIL_TEST);
+ 	glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
+ 	glViewport(vp[0], vp[1], vp[2], vp[3]);
++	s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 
+ 	/* Sentinels, not the real state — see GR_DrawFullscreenTexture: recording the
+ 	 * truth lets GR_SetBlendMode early-return and strand depth off. */
+@@ -6322,11 +6733,26 @@ static void GR_ClearAllFeedbackRects(void)
+ 	if (!g_psxDispBufValid)
+ 		return;
+ 
++	const int rects[3][4] = {
++		{ g_psxDispBuf[0].x, g_psxDispBuf[0].y, g_psxDispBuf[0].w, g_psxDispBuf[0].h },
++		{ g_psxDispBuf[1].x, g_psxDispBuf[1].y, g_psxDispBuf[1].w, g_psxDispBuf[1].h },
++		{ g_sceneFbRedirect.x, g_sceneFbRedirect.y,
++		  g_sceneFbRedirectTtl > 0 ? g_sceneFbRedirect.w : 0, g_sceneFbRedirectTtl > 0 ? g_sceneFbRedirect.h : 0 } };
++	if (s_rgdsFbClearCache && s_rgdsFbClean && s_rgdsFbCleanTex == g_vramTexture &&
++	    memcmp(rects, s_rgdsFbCleanRects, sizeof(rects)) == 0)
++		return;
++	s_rgdsInFbClear = true;
++
+ 	GR_ClearVramRect(g_psxDispBuf[0].x, g_psxDispBuf[0].y, g_psxDispBuf[0].w, g_psxDispBuf[0].h);
+ 	GR_ClearVramRect(g_psxDispBuf[1].x, g_psxDispBuf[1].y, g_psxDispBuf[1].w, g_psxDispBuf[1].h);
+ 
+ 	if (g_sceneFbRedirectTtl > 0)
+ 		GR_ClearVramRect(g_sceneFbRedirect.x, g_sceneFbRedirect.y, g_sceneFbRedirect.w, g_sceneFbRedirect.h);
++
++	s_rgdsInFbClear = false;
++	s_rgdsFbClean = s_rgdsFbClearCache;
++	s_rgdsFbCleanTex = g_vramTexture;
++	memcpy(s_rgdsFbCleanRects, rects, sizeof(rects));
+ }
+ 
+ /* Capture the frame as rendered so far into the (w x h) pack texture, mapped so
+@@ -6527,7 +6953,8 @@ extern "C" void GR_StoreFrameBufferPsx(void)
+ 	 * frame. See g_PsxFeedbackStoreAllowed. */
+ 	if (g_PsxFeedbackStoreAllowed <= 0)
+ 	{
+-		GR_ClearAllFeedbackRects();
++		if (!s_rgdsDiagNoFbClear)
++			GR_ClearAllFeedbackRects();
+ 		GR_SceneRedirectTick();
+ 		return;
+ 	}
+@@ -7125,8 +7552,11 @@ static void GreyFrame_Present(int w, int h)
+ 	memset(&s_gf, 0, sizeof(s_gf));
+ }
+ 
++extern "C" { int g_RgdsSwapCount = 0; }
++
+ void GR_SwapWindow()
+ {
++	g_RgdsSwapCount++;
+ 	{
+ 		extern int g_PsxFrameVerts, g_PsxLastFrameVerts;
+ 		g_PsxLastFrameVerts = g_PsxFrameVerts;
+@@ -7148,6 +7578,7 @@ void GR_SwapWindow()
+ 		glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+ 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+ 		glViewport(0, 0, g_presentWidth, g_presentHeight);
++		s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 
+ 		/* Scissor would clip both the clear and the blit to whatever the frame
+ 		 * last set, so it is off for the present. */
+@@ -7170,10 +7601,12 @@ void GR_SwapWindow()
+ 		{
+ 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 			glViewport(dx, dy, dw, dh);
++			s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 			s_overlayToWindow = 1;
+ 			g_PsyX_PostCaptureHook();
+ 			s_overlayToWindow = 0;
+ 			glViewport(0, 0, g_presentWidth, g_presentHeight);
++			s_rgdsViewportValid = false; s_rgdsActiveUnit = -1;
+ 		}
+ 		if (g_PsxVoidProbeArmed)
+ 		{
+@@ -7375,7 +7808,7 @@ void GR_SetBlendMode(BlendMode blendMode)
+ 	g_PsxFogToBlack = (blendMode == BM_ADD || blendMode == BM_SUBTRACT ||
+ 	                   blendMode == BM_ADD_QUATER_SOURCE) ? 1 : 0;
+ 	if (u_fogToBlackLoc != -1)
+-		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
++		GR_CachedUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+ 	if (blendMode == BM_NONE)
+ 	{
+ 		if (g_PreviousBlendMode != BM_NONE)
+@@ -7456,7 +7889,12 @@ void GR_SetPolygonOffset(float ofs)
+ void GR_SetViewPort(int x, int y, int width, int height)
+ {
+ #if USE_OPENGL
++	if (GR_RgdsCacheEnabled() && s_rgdsViewportValid && s_rgdsViewport[0] == x && s_rgdsViewport[1] == y &&
++	    s_rgdsViewport[2] == width && s_rgdsViewport[3] == height)
++		return;
+ 	glViewport(x, y, width, height);
++	s_rgdsViewport[0] = x; s_rgdsViewport[1] = y; s_rgdsViewport[2] = width; s_rgdsViewport[3] = height;
++	s_rgdsViewportValid = true;
+ #endif
+ }
+ 
+@@ -7518,6 +7956,7 @@ extern "C" int Pc_ModernMesh_PrepareDraw(unsigned int, PcModernDrawBinding*);
+ 
+ int GR_DrawModernMesh(unsigned int mesh_handle)
+ {
++	GR_RgdsBatchBoundary();
+ 	PcModernDrawBinding binding; GTEShader* modern;
+ 	if (!Pc_ModernMesh_PrepareDraw(mesh_handle, &binding) || binding.vertexCount < 3)
+ 		return 0;
+@@ -7704,6 +8143,7 @@ extern "C" void GR_FarMeshDraw(unsigned handle, const float base[3], const float
+  * the next legacy split through that shader would run the far branch. */
+ extern "C" void GR_FarMeshEnd(void)
+ {
++	GR_RgdsBatchBoundary();
+ 	for (int i = 0; i < 8; i++)
+ 	{
+ 		if (s_farMeshLocs[i].prog != 0 && s_farMeshLocs[i].mode != -1)
+@@ -7720,6 +8160,7 @@ extern "C" void GR_FarMeshEnd(void)
+ 
+ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
+ {
++	GR_RgdsBatchBoundary();
+ 	if (num_vertices >= MAX_VERTEX_BUFFER_SIZE)
+ 	{
+ 		eprinterr("MAX_VERTEX_BUFFER_SIZE reached, expect rendering errors\n");
+@@ -7747,7 +8188,10 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
+ 	 * GPU holds the buffer, so it is largest on tilers and shared-memory iGPUs
+ 	 * and smallest on a discrete desktop card — but it is never a pessimisation,
+ 	 * and the size is constant so drivers can recycle identical blocks. */
+-	glBufferData(GL_ARRAY_BUFFER, MAX_VERTEX_BUFFER_SIZE * sizeof(GrVertex), NULL, GL_STREAM_DRAW);
++	/* Mali retains orphaned storage while tiles are in flight. Reserving the
++	 * whole-town ceiling for every tiny menu pass exhausts 1 GB devices. */
++	const int capacity = getenv("SH_RGDS") ? ((num_vertices + 4095) / 4096 + 1) * 4096 : MAX_VERTEX_BUFFER_SIZE;
++	glBufferData(GL_ARRAY_BUFFER, capacity * sizeof(GrVertex), NULL, GL_STREAM_DRAW);
+ 	glBufferSubData(GL_ARRAY_BUFFER, 0, num_vertices * sizeof(GrVertex), vertices);
+ #else
+ #error
+@@ -7760,6 +8204,8 @@ void GR_DrawTriangles(int start_vertex, int triangles)
+ 	if (s_gf.draws++ == 0)
+ 		GreyFrame_FirstDraw();
+ 	s_gf.tris += triangles;
++	if (s_rgdsDiagNoDraw)
++		return;
+ 	glDrawArrays(GL_TRIANGLES, start_vertex, triangles * 3);
+ #else
+ #error
+@@ -7782,4 +8228,4 @@ void GR_PopDebugLabel()
+ 		return;
+ 	glPopDebugGroup();
+ #endif
+-}
+\ No newline at end of file
++}
+diff --git a/src/render/rgds_uniform_cache.h b/src/render/rgds_uniform_cache.h
+new file mode 100644
+index 0000000..f399bd4
+--- /dev/null
++++ b/src/render/rgds_uniform_cache.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef RGDS_UNIFORM_CACHE_H
++#define RGDS_UNIFORM_CACHE_H
++
++#include <stdint.h>
++#include <string.h>
++
++class RgdsUniformCache
++{
++    struct Value {
++        uint32_t epoch;
++        unsigned char kind, bytes, data[64];
++    };
++    struct Program {
++        uint32_t id;
++        Value values[128];
++    } programs[8] = {};
++    uint32_t epoch = 1;
++
++public:
++    void invalidate()
++    {
++        if (++epoch == 0) {
++            memset(programs, 0, sizeof(programs));
++            epoch = 1;
++        }
++    }
++
++    bool unchanged(uint32_t program, int location, unsigned char kind, const void* data, size_t bytes)
++    {
++        if (!program || program == UINT32_MAX || location < 0 || location >= 128 || !bytes || bytes > 64)
++            return false;
++        for (Program& p : programs) {
++            if (!p.id) p.id = program;
++            if (p.id != program) continue;
++            Value& value = p.values[location];
++            if (value.epoch == epoch && value.kind == kind && value.bytes == bytes &&
++                memcmp(value.data, data, bytes) == 0)
++                return true;
++            value.epoch = epoch;
++            value.kind = kind;
++            value.bytes = (unsigned char)bytes;
++            memcpy(value.data, data, bytes);
++            return false;
++        }
++        return false;
++    }
++};
++
++#endif

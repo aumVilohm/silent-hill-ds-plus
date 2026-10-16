@@ -1,0 +1,2 @@
+Put your own Silent Hill disc image into this folder: the .bin and .cue, or the .zip
+they came in. Then run prepare.bat (Windows) or prepare.sh (macOS and Linux).

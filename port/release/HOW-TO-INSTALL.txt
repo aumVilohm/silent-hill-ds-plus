@@ -1,0 +1,13 @@
+Silent Hill DS+ for the Anbernic RG DS Plus (ROCKNIXDS)
+
+No game files are included. You need your own copy of Silent Hill (PlayStation).
+
+1. Put your disc image into the "game" folder: the .bin and .cue, or the .zip
+   they came in.
+2. Run the prepare script. On Windows, double-click prepare.bat. On macOS or
+   Linux, open a terminal in this folder and run:  sh prepare.sh
+   It checks your image and puts it into the port folder.
+3. Copy everything inside the "ports" folder into roms/ports on the console.
+4. Restart the console and start SilentHill from Ports.
+
+More, including controls: https://github.com/aumVilohm/silent-hill-ds-plus
